@@ -1,0 +1,571 @@
+import express from "express";
+import cors from "cors";
+import { readFileSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+
+// Load .env before any other imports
+const __dirname = dirname(fileURLToPath(import.meta.url));
+try {
+  const envFile = readFileSync(resolve(__dirname, "../.env"), "utf-8");
+  for (const line of envFile.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    if (key && !(key in process.env)) process.env[key] = val;
+  }
+} catch {
+  console.warn(".env not found, using system env");
+}
+
+import { generateAIResponse } from "./lib/ai.js";
+import { shouldTriggerFlow, runFlow, startFlow } from "./lib/flow.js";
+import { calculatePlan } from "./lib/calculator.js";
+import { buildAIContext } from "./lib/config.js";
+import { createTicket, getAllTickets, updateTicketStatus, addReply } from "./lib/tickets.js";
+import { sendTicketEmails, sendReplyEmail } from "./lib/mailer.js";
+import { validateEmail } from "./lib/emailValidator.js";
+import { startGmailPoller } from "./lib/gmailPoller.js";
+import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
+import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
+import { createOrder } from "./lib/payment.js";
+import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
+import crypto from "crypto";
+
+// INR base prices — source of truth (never trust frontend price)
+const PLAN_PRICES_INR = {
+  Nano: 69, Basic: 0, Plus: 129, Starter: 199,
+  Pro: 329, Elite: 469, Ultra: 649, Max: 829, Titan: 1099,
+};
+
+// ── Rate limiter: max 3 tickets per email per 10 minutes ──────────────────────
+const ticketRateMap = new Map(); // email → [timestamps]
+function checkRateLimit(email) {
+  const now = Date.now();
+  const window = 10 * 60 * 1000; // 10 min
+  const max = 3;
+  const times = (ticketRateMap.get(email) || []).filter(t => now - t < window);
+  if (times.length >= max) {
+    const retryIn = Math.ceil((window - (now - times[0])) / 60000);
+    return { allowed: false, retryIn };
+  }
+  times.push(now);
+  ticketRateMap.set(email, times);
+  return { allowed: true };
+}
+
+// ── Escalation detection + varied responses ───────────────────────────────────
+const ESCALATION_TRIGGERS = [
+  "connect me to a human", "connect me with a human", "talk to a human", "speak to a human",
+  "real support", "human support", "talk to someone", "speak to someone",
+  "escalate", "i want support", "need human", "live agent", "live support",
+  "support agent", "support executive", "contact support", "human agent",
+  "speak with someone", "talk with someone", "real person", "actual person",
+];
+
+const ESCALATION_FRUSTRATED = [
+  "i give up", "this is useless", "not helping", "still not working",
+  "nothing works", "fed up", "so frustrated", "terrible", "worst",
+  "doesn't work", "still broken", "same issue", "same problem",
+];
+
+const ESCALATION_OFFERS = {
+  neutral: [
+    "I can connect you with a human support executive. Would you like me to do that?",
+    "Want me to loop in a real support agent? They can take it from here.",
+    "I can get a human support executive on this for you. Should I do that?",
+    "Sure, I can connect you with our support team. Want me to do that?",
+  ],
+  frustrated: [
+    "I understand this is frustrating. I can escalate this to a human support executive right away — want me to?",
+    "I hear you — let me get a real support agent involved. Should I do that?",
+    "You've been patient enough. I can connect you with a human support executive immediately. Want me to?",
+    "I'm sorry this hasn't been resolved. Our support team can take over — want me to connect you now?",
+  ],
+  confused: [
+    "Of course — I can connect you with a human support executive right now. Should I go ahead?",
+    "Sure thing. Want me to connect you with a real support agent?",
+    "I can get a human support executive on this for you. Want me to do that?",
+    "I can connect you with our support team straight away. Should I?",
+  ],
+};
+
+function pickEscalationOffer(message, history) {
+  const lower = message.toLowerCase();
+  const historyText = history.map(h => h.content).join(" ").toLowerCase();
+  const combined = lower + " " + historyText;
+
+  const isFrustrated = ESCALATION_FRUSTRATED.some(t => combined.includes(t));
+  // Confused = repeated questions or long history without resolution
+  const isConfused = history.length >= 4;
+
+  const pool = isFrustrated
+    ? ESCALATION_OFFERS.frustrated
+    : isConfused
+    ? ESCALATION_OFFERS.confused
+    : ESCALATION_OFFERS.neutral;
+
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function shouldEscalate(message) {
+  const lower = message.toLowerCase();
+  return ESCALATION_TRIGGERS.some(t => lower.includes(t));
+}
+
+
+const PORT = process.env.API_PORT || 3001;
+
+// CORS — allow frontend origins (localhost dev + Netlify production)
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:8080",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS blocked: ${origin}`));
+  },
+  credentials: true,
+}));
+app.use(express.json());
+
+const MAX_MSG_LENGTH = 500;
+
+// Simple 60s cache for AI context
+let ctxCache = null;
+let ctxCachedAt = 0;
+function getContext() {
+  const now = Date.now();
+  if (!ctxCache || now - ctxCachedAt > 60_000) {
+    ctxCache    = buildAIContext();
+    ctxCachedAt = now;
+  }
+  return ctxCache;
+}
+
+// ── GET /api/ai-context ───────────────────────────────────────────────────────
+app.get("/api/ai-context", (_req, res) => {
+  res.json(getContext());
+});
+
+// ── POST /api/calculate-plan ──────────────────────────────────────────────────
+app.post("/api/calculate-plan", (req, res) => {
+  const { players, type, plugins = 0, activity, version } = req.body;
+  if (!players || !type || !activity || !version) {
+    return res.status(400).json({ error: "Missing required fields: players, type, activity, version" });
+  }
+  try {
+    const result = calculatePlan({ players: Number(players), type, plugins: Number(plugins), activity, version });
+    console.log("[/api/calculate-plan]", result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/check-subdomain ─────────────────────────────────────────────────
+// Simulated — wire to DB later
+const RESERVED = new Set([
+  "minecraft", "survival", "smp", "hub", "play", "pvp",
+  "creative", "lobby", "test", "demo", "admin", "api", "www",
+]);
+
+app.post("/api/check-subdomain", (req, res) => {
+  const { name } = req.body;
+  if (!name || typeof name !== "string") {
+    return res.status(400).json({ error: "name is required" });
+  }
+  const clean = name.trim().toLowerCase();
+  if (!/^[a-z0-9-]{3,32}$/.test(clean)) {
+    return res.status(400).json({ error: "Invalid subdomain format" });
+  }
+  const available = !RESERVED.has(clean);
+  const suggestions = available ? [] : [
+    `${clean}123`, `play${clean}`, `${clean}hub`,
+  ];
+  res.json({ available, name: clean, suggestions });
+});
+
+// ── POST /api/chat ────────────────────────────────────────────────────────────
+app.post("/api/chat", async (req, res) => {
+  const { message, history = [], flowState = null } = req.body;
+
+  if (!message || typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ error: "Message is required." });
+  }
+  if (message.length > MAX_MSG_LENGTH) {
+    return res.status(400).json({ error: `Max ${MAX_MSG_LENGTH} characters.` });
+  }
+
+  try {
+    const ctx = getContext();
+    const lower = message.trim().toLowerCase();
+
+    // ── If we're waiting for escalation confirmation ──────────────────────────
+    if (flowState?.awaitingEscalation) {
+      const confirmed = /^(yes|yeah|sure|ok|okay|please|yep|yup|do it|go ahead|connect|yes please)/.test(lower);
+      if (confirmed) {
+        return res.json({
+          message: "ESCALATE_CONFIRMED",
+          showButtons: false, recommendedPlan: null, ramRequired: null, flowState: null,
+        });
+      } else {
+        // User declined — clear the flag and continue normally
+        return res.json({
+          message: "No problem! I'll keep trying to help. What else can I do for you?",
+          showButtons: false, recommendedPlan: null, ramRequired: null, flowState: null,
+        });
+      }
+    }
+
+    // Continue guided flow if active
+    if (flowState?.step && flowState.step !== "done") {
+      const result = runFlow(flowState, message, ctx);
+      if (result) {
+        return res.json({
+          message:         result.message,
+          showButtons:     result.showButtons,
+          recommendedPlan: result.recommendedPlan,
+          ramRequired:     result.ramRequired ?? null,
+          flowState:       result.nextState,
+        });
+      }
+    }
+
+    // Trigger guided flow — extract any info already in the message
+    if (shouldTriggerFlow(message)) {
+      const result = startFlow(message);
+      return res.json({
+        message:         result.message,
+        showButtons:     false,
+        recommendedPlan: null,
+        ramRequired:     null,
+        flowState:       result.nextState,
+      });
+    }
+
+    // Escalation — intercept before AI, use varied backend responses
+    if (shouldEscalate(message)) {
+      const offer = pickEscalationOffer(message, history);
+      return res.json({
+        message:         offer,
+        showButtons:     false,
+        recommendedPlan: null,
+        ramRequired:     null,
+        flowState:       { awaitingEscalation: true },
+      });
+    }
+
+    // Free-form AI with live context
+    const { text, planResult } = await generateAIResponse(message.trim(), history, ctx, req.body.attachment ?? null);
+
+    // Parse PLAN / SHOW_BUTTONS directives from AI response
+    const planMatch   = text.match(/^PLAN:\s*(.+)$/m);
+    const actionMatch = text.match(/^ACTION:\s*SHOW_BUTTONS/m);
+    const cleanText   = text
+      .replace(/CALCULATE_PLAN[\s\S]*?\}/g, "")
+      .replace(/^PLAN:.*$/m, "")
+      .replace(/^ACTION:.*$/m, "")
+      .trim();
+
+    const recommendedPlan = planResult?.recommended_plan
+      ?? (planMatch ? planMatch[1].trim() : null);
+
+    console.log("[/api/chat] plan=%s showButtons=%s", recommendedPlan, !!actionMatch);
+
+    return res.json({
+      message:         cleanText,
+      showButtons:     !!actionMatch,
+      recommendedPlan: recommendedPlan,
+      ramRequired:     recommendedPlan
+        ? ctx.PLAN_SPECS[recommendedPlan]?.ram ?? null
+        : null,
+      flowState:       null,
+      planResult:      planResult ?? null,
+    });
+
+  } catch (err) {
+    console.error("[NetherNodes AI Error]", err?.message || err);
+    return res.status(500).json({ error: "Server is busy, please try again." });
+  }
+});
+
+// ── POST /api/create-ticket ───────────────────────────────────────────────────
+app.post("/api/create-ticket", async (req, res) => {
+  const { email, issue, chat_history } = req.body;
+  if (!email || !issue) {
+    return res.status(400).json({ error: "email and issue are required" });
+  }
+
+  // Validate email — format, disposable domain, MX record
+  const emailCheck = await validateEmail(email);
+  if (!emailCheck.valid) {
+    return res.status(400).json({ error: emailCheck.reason });
+  }
+
+  // Rate limit check
+  const rate = checkRateLimit(email.toLowerCase());
+  if (!rate.allowed) {
+    return res.status(429).json({
+      error: `Too many tickets. Please wait ${rate.retryIn} minute${rate.retryIn > 1 ? "s" : ""} before submitting again.`
+    });
+  }
+
+  try {
+    // Generate structured issue summary from conversation
+    let cleanIssue = issue;
+    try {
+      const { text } = await generateAIResponse(
+        `You are a support ticket classifier for a Minecraft hosting service. Based on the information below, generate a structured issue summary in EXACTLY this format (no extra text, no preamble):
+
+Issue Type: <short category, e.g. "Server Lag", "Connection Timeout", "Plugin Issue", "Billing Question">
+Likely Cause: <most probable technical or account reason>
+User Situation: <one sentence describing what the user is experiencing>
+
+User's issue: ${issue}
+
+${chat_history ? `Conversation context:\n${chat_history}` : ""}`,
+        [], null
+      );
+      const issueType     = text.match(/Issue Type:\s*(.+)/i)?.[1]?.trim();
+      const likelyCause   = text.match(/Likely Cause:\s*(.+)/i)?.[1]?.trim();
+      const userSituation = text.match(/User Situation:\s*(.+)/i)?.[1]?.trim();
+      if (issueType && likelyCause && userSituation) {
+        cleanIssue = `Issue Type: ${issueType}\nLikely Cause: ${likelyCause}\nUser Situation: ${userSituation}`;
+      }
+    } catch { /* fallback to raw issue */ }
+
+    const ticket = createTicket({ email, issue: cleanIssue, chat_history: chat_history || "" });
+    console.log("[Ticket Created]", ticket.id, email);
+    await sendTicketEmails(ticket);
+    console.log("[Emails Sent]", ticket.id);
+    return res.json({ ticket_id: ticket.id, email: ticket.email, status: "created" });
+  } catch (err) {
+    console.error("[Ticket Error]", err?.message || err);
+    return res.status(500).json({ error: "Failed to create ticket: " + (err?.message || err) });
+  }
+});
+
+// ── POST /api/admin/tickets/:id/reply ────────────────────────────────────────
+app.post("/api/admin/tickets/:id/reply", async (req, res) => {
+  const { message } = req.body;
+  if (!message || !message.trim()) {
+    return res.status(400).json({ error: "message is required" });
+  }
+  const tickets = getAllTickets();
+  const ticket = tickets.find(t => t.id === req.params.id);
+  if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+
+  try {
+    await sendReplyEmail(ticket, message.trim());
+    // Store reply and set status to pending (awaiting customer response)
+    addReply(req.params.id, { from: "support", message: message.trim() });
+    updateTicketStatus(req.params.id, "pending");
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[Reply Error]", err?.message || err);
+    return res.status(500).json({ error: "Failed to send reply: " + (err?.message || err) });
+  }
+});
+
+// ── POST /api/webhook/inbound-email ───────────────────────────────────────────
+// Wire this to SendGrid Inbound Parse / Mailgun / Postmark webhook
+// They POST parsed email fields to this endpoint
+app.post("/api/webhook/inbound-email", (req, res) => {
+  // Support SendGrid (from, subject, text), Mailgun (sender, subject, body-plain), raw
+  const from    = req.body.from || req.body.sender || "";
+  const subject = req.body.subject || "";
+  const text    = req.body.text || req.body["body-plain"] || req.body.plain || "";
+
+  // Extract ticket ID from subject line: "Re: Your Support Ticket NN-XXXXXX"
+  const idMatch = subject.match(/NN-\d{6}/);
+  if (!idMatch) {
+    console.log("[Inbound Email] No ticket ID found in subject:", subject);
+    return res.status(200).json({ ok: true, note: "no ticket id" });
+  }
+
+  const ticketId = idMatch[0];
+  const ticket = getAllTickets().find(t => t.id === ticketId);
+  if (!ticket) {
+    console.log("[Inbound Email] Ticket not found:", ticketId);
+    return res.status(200).json({ ok: true, note: "ticket not found" });
+  }
+
+  // Store customer reply and reopen ticket
+  addReply(ticketId, { from: "customer", message: text.trim() });
+  updateTicketStatus(ticketId, "open");
+  console.log("[Inbound Email] Reply added to", ticketId, "from", from);
+  res.status(200).json({ ok: true });
+});
+
+// ── POST /api/admin/login ─────────────────────────────────────────────────────
+app.post("/api/admin/login", (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+  const result = login(username, password);
+  if (!result) return res.status(401).json({ error: "Invalid username or password" });
+  res.json(result);
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  const token = req.headers["x-admin-token"];
+  if (token) logout(token);
+  res.json({ ok: true });
+});
+
+app.get("/api/admin/me", (req, res) => {
+  const token = req.headers["x-admin-token"];
+  const user = getSession(token);
+  if (!user) return res.status(401).json({ error: "Not authenticated" });
+  res.json(user);
+});
+
+app.get("/api/admin/staff", requireAuth, requireOwner, (_req, res) => res.json(getAllStaff()));
+
+app.post("/api/admin/staff", requireAuth, requireOwner, (req, res) => {
+  const { username, password, permissions } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "username and password required" });
+  try { res.json(createStaff({ username, password, permissions })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.patch("/api/admin/staff/:id", requireAuth, requireOwner, (req, res) => {
+  try { res.json(updateStaff(req.params.id, req.body)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.delete("/api/admin/staff/:id", requireAuth, requireOwner, (req, res) => {
+  try { deleteStaff(req.params.id); res.json({ ok: true }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── GET /api/rates ────────────────────────────────────────────────────────────
+app.get("/api/rates", async (_req, res) => {
+  try {
+    const rates = await getRates();
+    res.json({ rates, currencies: SUPPORTED_CURRENCIES });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/create-order ────────────────────────────────────────────────────
+app.post("/api/create-order", async (req, res) => {
+  const { planName, currency, userEmail } = req.body;
+  if (!planName || !currency) {
+    return res.status(400).json({ error: "planName and currency required" });
+  }
+  // Server-side price — never trust frontend
+  const planPriceInr = PLAN_PRICES_INR[planName];
+  if (planPriceInr === undefined) {
+    return res.status(400).json({ error: "Invalid plan" });
+  }
+  if (planPriceInr === 0) {
+    return res.status(400).json({ error: "This plan is currently free — no payment needed." });
+  }
+  try {
+    const order = await createOrder({ planName, planPrice: planPriceInr, currency: currency || "INR", userEmail: userEmail || "" });
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/verify-payment ──────────────────────────────────────────────────
+app.post("/api/verify-payment", (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planName, userEmail } = req.body;
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: "Missing payment verification fields" });
+  }
+
+  const secret = process.env.RAZORPAY_KEY_SECRET;
+  if (!secret || secret === "REPLACE_ME") {
+    // Dev mode — mock verification
+    console.log("[Payment] Mock verification for", planName, userEmail);
+    return res.json({ verified: true, mock: true, planName, userEmail });
+  }
+
+  const body = razorpay_order_id + "|" + razorpay_payment_id;
+  const expectedSig = crypto.createHmac("sha256", secret).update(body).digest("hex");
+
+  if (expectedSig !== razorpay_signature) {
+    return res.status(400).json({ error: "Payment verification failed — signature mismatch" });
+  }
+
+  console.log("[Payment] Verified:", razorpay_payment_id, "for", planName, userEmail);
+  // TODO: provision server, save to DB, send confirmation email
+  res.json({ verified: true, mock: false, planName, userEmail, paymentId: razorpay_payment_id });
+});
+
+// ── GET /api/sale ─────────────────────────────────────────────────────────────
+// Public — only returns banner data. Never exposes codes.
+app.get("/api/sale", (_req, res) => {
+  const sale = getActiveSale();
+  if (!sale) return res.json(null);
+  // Only return banner info for public mode — codes are validated separately
+  if (sale.mode !== "public") {
+    // Tell frontend a code mode is active (so it shows the promo input) but no codes exposed
+    return res.json({ mode: sale.mode, enabled: true });
+  }
+  res.json(sale);
+});
+
+// ── POST /api/sale/validate-code ──────────────────────────────────────────────
+app.post("/api/sale/validate-code", (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "code is required" });
+  const result = validateCode(code);
+  if (!result) return res.status(404).json({ error: "Invalid or expired code" });
+  res.json(result);
+});
+
+// ── GET /api/admin/sale ───────────────────────────────────────────────────────
+app.get("/api/admin/sale", (_req, res) => {
+  res.json(getSale());
+});
+
+// ── POST /api/admin/sale ──────────────────────────────────────────────────────
+app.post("/api/admin/sale", (req, res) => {
+  const current = getSale();
+  const updated = { ...current, ...req.body };
+  saveSale(updated);
+  res.json(updated);
+});
+
+// ── GET /api/admin/tickets ────────────────────────────────────────────────────
+app.get("/api/admin/tickets", (_req, res) => {
+  res.json(getAllTickets());
+});
+
+// ── POST /api/admin/poll-inbox ────────────────────────────────────────────────
+app.post("/api/admin/poll-inbox", async (_req, res) => {
+  try {
+    const { pollOnce } = await import("./lib/gmailPoller.js");
+    await pollOnce();
+    res.json({ ok: true, message: "Inbox checked" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/admin/tickets/:id ──────────────────────────────────────────────
+app.patch("/api/admin/tickets/:id", (req, res) => {
+  const { status } = req.body;
+  if (!["open", "pending", "closed"].includes(status)) {
+    return res.status(400).json({ error: "status must be open, pending, or closed" });
+  }
+  const ticket = updateTicketStatus(req.params.id, status);
+  if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+  res.json(ticket);
+});
+
+app.listen(PORT, () => {
+  console.log(`NetherNodes AI server running on port ${PORT}`);
+  startGmailPoller(60_000); // poll Gmail every 60s for customer replies
+});

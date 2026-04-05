@@ -1,0 +1,126 @@
+[
+  {
+    "id": "NN-400311",
+    "email": "maxwebdev1@gmail.com",
+    "issue": "yes",
+    "chat_history": "User: hey connect me to a human\nAI: I can connect you with a human support executive. Would you like me to do that?\nUser: yes\nAI: ESCALATE_CONFIRMED",
+    "status": "closed",
+    "created_at": "2026-04-03T07:57:44.098Z"
+  },
+  {
+    "id": "NN-952243",
+    "email": "maximalog1@gmail.com",
+    "issue": "User confirmed they need human support, but no specific server issue details were provided.",
+    "chat_history": "User: im having trouble with my server\nAI: Sorry about that. What exactly is happening right now (server not starting, lag/low FPS, crash, or error in console)?\n\nIf you can, paste the last 20-30 lines of the server console/error, and tell me your server plan name.\nUser: i cannot join it says connection timed out\nAI: Connection timed out usually means a network/firewall/port issue or the server isn’t actually reachable.\n\nPlease share:\n1) Your server IP/port you’re trying (and what you used in the game)\n2) Server console status right now (is it “running” on the panel?)\n3) Any console log lines from the last 1-2 minutes\nUser: all are correct is it something server side ?\nAI: Yes, it can be server-side. Most common causes: server not fully up/crashed after start, wrong port, or firewall/network/DDoS block.\n\nPlease check these on the panel:\n1) Is the server status “Running” (not “Starting/Stopped”)?\n2) What port is shown for the server, and is Minecraft client using that exact port?\n3) Paste the console lines right after you start it (last ~2 minutes).\nUser: can a human talk with me about tthis ?\nAI: I can connect you with a human support executive. Would you like me to do that?\nUser: yes\nAI: ESCALATE_CONFIRMED",
+    "status": "closed",
+    "created_at": "2026-04-03T08:20:42.474Z"
+  },
+  {
+    "id": "NN-613174",
+    "email": "skiudfg@gmail.com",
+    "issue": "Issue Type: Human Support Request\nLikely Cause: User requested escalation to a human executive without specifying a technical problem\nUser Situation: The user asked to be connected to a human support executive and confirmed they want escalation",
+    "chat_history": "User: thank you can you connect me to a human executive for this\nAI: Sure. I can connect you with a human support executive. Would you like me to do that?\nUser: yes please\nAI: ESCALATE_CONFIRMED",
+    "status": "closed",
+    "created_at": "2026-04-03T08:31:04.695Z"
+  },
+  {
+    "id": "NN-130001",
+    "email": "maximalog1@gmail.com",
+    "issue": "Issue Type: Server Lag / Low FPS\nLikely Cause: High load from plugins/mods, insufficient resources for current activity, or a performance-related issue indicated in server logs\nUser Situation: The user reports FPS issues on their Minecraft server and requests escalation to a human support executive.",
+    "chat_history": "User: hey im having fps issues in my server\nAI: Sure, I can help.  \nWhat’s the exact issue: low FPS for players or server lag/low TPS? Also share your server specs (RAM/plan if you know it) and the server log error lines (last ~30 lines).\nUser: can you connect me to a human\nAI: I can connect you with a human support executive. Would you like me to do that?\nUser: yes\nAI: ESCALATE_CONFIRMED",
+    "status": "closed",
+    "created_at": "2026-04-03T11:20:46.853Z",
+    "replies": [
+      {
+        "from": "customer",
+        "message": "20 players, basic plan, 10 plugins",
+        "timestamp": "2026-04-03T13:20:03.628Z"
+      }
+    ]
+  },
+  {
+    "id": "NN-523503",
+    "email": "maximalog1@gmail.com",
+    "issue": "Issue Type: Escalation Confirmed\nLikely Cause: User requested or needs support beyond initial classification\nUser Situation: The user confirmed “yes” in response to an escalation prompt.",
+    "chat_history": "User: yes\nAI: ESCALATE_CONFIRMED",
+    "status": "closed",
+    "replies": [],
+    "created_at": "2026-04-03T12:11:31.750Z"
+  },
+  {
+    "id": "NN-200560",
+    "email": "maxwebdev1@gmail.com",
+    "issue": "Issue Type: Server Lag\nLikely Cause: High server load on Basic (2GB RAM) due to heavy player activity/plugins and potentially high world rendering settings (view/simulation distance) despite no visible errors\nUser Situation: The user reports the server is “fucking laggy” on Basic running latest version with around 20+10 participants and no error/console messages.",
+    "chat_history": "AI: Hey! I'm NetherNode AI. Need help picking a plan or setting up your server?\nUser: WHAT IS THIS\nAI: Hi! This is a Minecraft hosting platform by NetherNode AI.\n\nTell me what you’re trying to do: pick a plan, start a server, check pricing/specs, or fix an issue.\nUser: WHY IS MY SERVER SO FUCKING LAGGU\nAI: Sorry you’re dealing with that. To pinpoint the cause, send:\n1) Your plan name\n2) Server version (latest or older)\n3) Players online now + how many mods/plugins\n4) Any error/console spam (paste it)\nUser: basic, latest, 20+10, no errors\nAI: Got it. On Basic (2GB RAM, 100% CPU), 20+ people with plugins can lag if there are heavy plugins, frequent chunk/activity, or view-distance is high.\n\nCan you paste your server.properties values for:\nview-distance and simulation-distance (and render-distance if you changed it)?\nUser: connect me to a human\nAI: I think a human agent can sort this out faster. Want me to connect you?\nUser: yes\nAI: I'll need your email address so our support team can contact you.",
+    "status": "closed",
+    "replies": [
+      {
+        "from": "support",
+        "message": "Dear Customer, \nWe believe you are having troubles with your minecraft server on our hosting. Could you please describe your issue further ?",
+        "timestamp": "2026-04-03T12:17:55.776Z"
+      },
+      {
+        "from": "customer",
+        "message": "The server is lagging too much I don't know why I paid for it.",
+        "timestamp": "2026-04-03T13:20:03.647Z"
+      }
+    ],
+    "created_at": "2026-04-03T12:16:03.537Z"
+  },
+  {
+    "id": "NN-824837",
+    "email": "bastionai.app@gmail.com",
+    "issue": "Issue Type: Server Lag\nLikely Cause: Server resources (CPU/RAM) being overwhelmed by 20 players causing performance degradation\nUser Situation: The user reports their Minecraft server is lagging and requests a human support contact to help resolve it.",
+    "chat_history": "AI: Hey! I'm NetherNode AI. Need help picking a plan or setting up your server?\nUser: could you connect me to a human. my server is lagging with 20 players\nAI: I can get a human support executive on this for you. Should I do that?\nUser: yes\nAI: I'll need your email address so our support team can contact you.",
+    "status": "closed",
+    "replies": [
+      {
+        "from": "support",
+        "message": "Thanks for reaching out! I understand your Minecraft server is experiencing lag with around 20 players online.\n\nThis usually happens when server resources (like CPU and RAM) are being pushed beyond their limits. Here are a few quick things you can try while we look into this further for you:\n\nRestart the server to clear temporary load\nReduce the number of active plugins/mods if you’re using any\nLower view-distance and simulation-distance settings\nMake sure no background processes are consuming resources\n\nIn the meantime, I’ve escalated your request to our support team so we can take a closer look and help optimize your setup. We’ll reach out shortly using this email with more specific recommendations.\n\nIf you have any additional details (like your server plan or mods installed), feel free to reply here—it’ll help us speed things up.\n\nThanks for your patience!",
+        "timestamp": "2026-04-03T13:00:31.602Z"
+      },
+      {
+        "from": "customer",
+        "message": "Im on the basic plan",
+        "timestamp": "2026-04-03T13:20:03.656Z"
+      },
+      {
+        "from": "support",
+        "message": "thats the problem. basic plan (2gb ram) cannot handle 20 players. for that we recommend atleast 6gb ram",
+        "timestamp": "2026-04-03T13:20:44.196Z"
+      },
+      {
+        "from": "customer",
+        "message": "So I have to upgrade the plan again",
+        "timestamp": "2026-04-03T13:21:51.146Z"
+      },
+      {
+        "from": "support",
+        "message": "yes",
+        "timestamp": "2026-04-03T13:22:58.181Z"
+      }
+    ],
+    "created_at": "2026-04-03T12:57:59.938Z"
+  },
+  {
+    "id": "NN-151016",
+    "email": "maximalog1@gmail.com",
+    "issue": "Issue Type: Connection Timeout\nLikely Cause: User requesting assistance from human support\nUser Situation: User is seeking to connect with a human support representative.",
+    "chat_history": "AI: Hey! I'm NetherNodes AI. Need help picking a plan or setting up your server?\nUser: connect me to a human\nAI: I can get a human support executive on this for you. Should I do that?\nUser: yes\nAI: I'll need your email address so our support team can contact you.",
+    "status": "closed",
+    "replies": [
+      {
+        "from": "support",
+        "message": "what is your piroblem",
+        "timestamp": "2026-04-05T08:08:12.563Z"
+      },
+      {
+        "from": "customer",
+        "message": "Phuk you",
+        "timestamp": "2026-04-05T08:08:52.593Z"
+      }
+    ],
+    "created_at": "2026-04-05T08:06:46.762Z",
+    "messageId": "<f34b7a84-e08b-31e5-32a5-07fdc6b940a4@gmail.com>"
+  }
+]

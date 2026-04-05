@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "label": "Sale",
+  "discount": 25,
+  "discountType": "percent",
+  "mode": "public",
+  "code": "",
+  "codes": [],
+  "plans": [
+    "Titan"
+  ],
+  "startDate": "2026-04-03T14:51:00.000Z",
+  "endDate": "2026-04-13T12:26:00.000Z",
+  "showCountdown": true,
+  "neverExpires": false
+}

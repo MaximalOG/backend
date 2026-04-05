@@ -1,0 +1,17 @@
+{
+  "name": "nethernodes-backend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "imapflow": "^1.2.18",
+    "nodemailer": "^8.0.4",
+    "openai": "^6.32.0"
+  }
+}
