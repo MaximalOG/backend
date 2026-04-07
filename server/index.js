@@ -37,11 +37,7 @@ import { userSignup, userLogin, getUserFromToken, requireUser, userLogout } from
 import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
 import crypto from "crypto";
 
-// INR base prices — source of truth (never trust frontend price)
-const PLAN_PRICES_INR = {
-  Nano: 69, Basic: 0, Plus: 129, Starter: 199,
-  Pro: 329, Elite: 469, Ultra: 649, Max: 829, Titan: 1099,
-};
+// INR base prices are defined in PLAN_SPECS below — single source of truth
 
 // ── Rate limiter: max 3 tickets per email per 10 minutes ──────────────────────
 const ticketRateMap = new Map(); // email → [timestamps]
@@ -502,21 +498,67 @@ app.get("/api/rates", async (_req, res) => {
 
 // ── POST /api/create-order ────────────────────────────────────────────────────
 app.post("/api/create-order", async (req, res) => {
-  const { planName, currency, userEmail } = req.body;
+  const { planName, currency, userEmail, couponCode } = req.body;
+
   if (!planName || !currency) {
     return res.status(400).json({ error: "planName and currency required" });
   }
-  // Server-side price — never trust frontend
-  const planPriceInr = PLAN_PRICES_INR[planName];
-  if (planPriceInr === undefined) {
-    return res.status(400).json({ error: "Invalid plan" });
-  }
-  if (planPriceInr === 0) {
+
+  // 1. Look up plan price server-side — never trust frontend price
+  const planKey = Object.keys(PLAN_SPECS).find(
+    k => k.toLowerCase() === String(planName).toLowerCase()
+  );
+  if (!planKey) return res.status(400).json({ error: "Invalid plan" });
+
+  const originalPrice = PLAN_SPECS[planKey].priceInr;
+  console.log(`[Order] Plan: ${planKey} | Original: ₹${originalPrice}`);
+
+  if (originalPrice === 0) {
     return res.status(400).json({ error: "This plan is currently free — no payment needed." });
   }
+
+  // 2. Validate and apply coupon server-side
+  let discountAmount = 0;
+  let couponLabel = null;
+
+  if (couponCode && couponCode.trim()) {
+    const coupon = validateCode(couponCode.trim());
+    if (coupon) {
+      if (coupon.discountType === "percent") {
+        discountAmount = Math.round(originalPrice * (coupon.discount / 100));
+      } else {
+        discountAmount = Math.min(coupon.discount, originalPrice);
+      }
+      couponLabel = coupon.label;
+      console.log(`[Order] Coupon: ${couponCode} (${coupon.discountType}) | Discount: ₹${discountAmount}`);
+    } else {
+      console.log(`[Order] Coupon invalid or expired: ${couponCode}`);
+    }
+  }
+
+  // 3. Calculate final price
+  const finalPrice = Math.max(0, originalPrice - discountAmount);
+  console.log(`[Order] Discount: ₹${discountAmount} | Final: ₹${finalPrice}`);
+
+  if (finalPrice === 0) {
+    return res.status(400).json({ error: "Coupon makes this plan free — no payment needed." });
+  }
+
   try {
-    const order = await createOrder({ planName, planPrice: planPriceInr, currency: currency || "INR", userEmail: userEmail || "" });
-    res.json(order);
+    const order = await createOrder({
+      planName: planKey,
+      planPrice: finalPrice,   // discounted price goes to Razorpay
+      currency: currency || "INR",
+      userEmail: userEmail || "",
+    });
+
+    res.json({
+      ...order,
+      originalPrice,
+      discountAmount,
+      finalPrice,
+      couponLabel,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
