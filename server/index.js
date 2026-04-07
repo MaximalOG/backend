@@ -33,6 +33,8 @@ import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
+import { userSignup, userLogin, getUserFromToken, requireUser, userLogout } from "./lib/userAuth.js";
+import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
 import crypto from "crypto";
 
 // INR base prices — source of truth (never trust frontend price)
@@ -118,11 +120,14 @@ function shouldEscalate(message) {
 
 
 const PORT = process.env.API_PORT || 3001;
+const app = express();
 
 // CORS — allow frontend origins (localhost dev + Netlify production)
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:8080",
+  "https://nethernodes.online",
+  "https://www.nethernodes.online",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -445,6 +450,30 @@ app.delete("/api/admin/staff/:id", requireAuth, requireOwner, (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── GET /api/plans ────────────────────────────────────────────────────────────
+const PLAN_SPECS = {
+  Nano:    { ram: "1GB",  cpu: "50%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
+  Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB",  priceInr: 0,    tier: "Entry" },
+  Plus:    { ram: "3GB",  cpu: "150%", ssd: "15GB",  priceInr: 129,  tier: "Entry" },
+  Starter: { ram: "4GB",  cpu: "200%", ssd: "25GB",  priceInr: 199,  tier: "Community", popular: true },
+  Pro:     { ram: "6GB",  cpu: "250%", ssd: "40GB",  priceInr: 329,  tier: "Community" },
+  Elite:   { ram: "8GB",  cpu: "300%", ssd: "60GB",  priceInr: 469,  tier: "Community" },
+  Ultra:   { ram: "10GB", cpu: "350%", ssd: "80GB",  priceInr: 649,  tier: "Advanced" },
+  Max:     { ram: "12GB", cpu: "400%", ssd: "100GB", priceInr: 829,  tier: "Advanced" },
+  Titan:   { ram: "16GB", cpu: "450%", ssd: "140GB", priceInr: 1099, tier: "Advanced" },
+};
+
+app.get("/api/plans", (_req, res) => {
+  const plans = Object.entries(PLAN_SPECS).map(([name, spec]) => ({ name, ...spec }));
+  res.json(plans);
+});
+
+app.get("/api/plans/:name", (req, res) => {
+  const spec = PLAN_SPECS[req.params.name];
+  if (!spec) return res.status(404).json({ error: "Plan not found" });
+  res.json({ name: req.params.name, ...spec });
+});
+
 // ── GET /api/rates ────────────────────────────────────────────────────────────
 app.get("/api/rates", async (_req, res) => {
   try {
@@ -565,7 +594,77 @@ app.patch("/api/admin/tickets/:id", (req, res) => {
   res.json(ticket);
 });
 
+// ── POST /api/auth/signup ─────────────────────────────────────────────────────
+app.post("/api/auth/signup", (req, res) => {
+  const { name, email, password } = req.body;
+  try {
+    const result = userSignup(name, email, password);
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── POST /api/auth/login ──────────────────────────────────────────────────────
+app.post("/api/auth/login", (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const result = userLogin(email, password);
+    res.json(result);
+  } catch (err) {
+    res.status(401).json({ error: err.message });
+  }
+});
+
+// ── GET /api/auth/me ──────────────────────────────────────────────────────────
+app.get("/api/auth/me", requireUser, (req, res) => {
+  res.json(req.user);
+});
+
+// ── POST /api/auth/logout ─────────────────────────────────────────────────────
+app.post("/api/auth/logout", (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (token) userLogout(token);
+  res.json({ ok: true });
+});
+
+// ── GET /api/servers ──────────────────────────────────────────────────────────
+app.get("/api/servers", requireUser, (req, res) => {
+  const servers = getServersByUser(req.user.id);
+  res.json(servers);
+});
+
+// ── POST /api/servers/:id/start ───────────────────────────────────────────────
+app.post("/api/servers/:id/start", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id);
+  if (!srv) return res.status(404).json({ error: "Server not found" });
+  if (srv.status === "running") return res.json(srv);
+
+  // Simulate async start — set to "starting" then "running" after 2s
+  const starting = setServerStatus(req.params.id, req.user.id, "starting");
+  setTimeout(() => setServerStatus(req.params.id, req.user.id, "running"), 2000);
+  res.json(starting);
+});
+
+// ── POST /api/servers/:id/stop ────────────────────────────────────────────────
+app.post("/api/servers/:id/stop", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id);
+  if (!srv) return res.status(404).json({ error: "Server not found" });
+  if (srv.status === "stopped") return res.json(srv);
+
+  // Simulate async stop — set to "stopping" then "stopped" after 2s
+  const stopping = setServerStatus(req.params.id, req.user.id, "stopping");
+  setTimeout(() => setServerStatus(req.params.id, req.user.id, "stopped"), 2000);
+  res.json(stopping);
+});
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
 app.listen(PORT, () => {
-  console.log(`NetherNodes AI server running on port ${PORT}`);
-  startGmailPoller(60_000); // poll Gmail every 60s for customer replies
+  console.log(`NetherNodes API running on port ${PORT}`);
+  startGmailPoller(60_000);
 });
