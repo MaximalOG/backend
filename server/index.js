@@ -450,6 +450,14 @@ app.delete("/api/admin/staff/:id", requireAuth, requireOwner, (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── GET /api/location ─────────────────────────────────────────────────────────
+// Used by frontend for currency auto-detection — no external API dependency.
+// Cloudflare sets cf-ipcountry header automatically on production.
+app.get("/api/location", (req, res) => {
+  const country = req.headers["cf-ipcountry"] || "IN";
+  res.json({ country });
+});
+
 // ── GET /api/plans ────────────────────────────────────────────────────────────
 const PLAN_SPECS = {
   Nano:    { ram: "1GB",  cpu: "50%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
@@ -469,9 +477,17 @@ app.get("/api/plans", (_req, res) => {
 });
 
 app.get("/api/plans/:name", (req, res) => {
-  const spec = PLAN_SPECS[req.params.name];
-  if (!spec) return res.status(404).json({ error: "Plan not found" });
-  res.json({ name: req.params.name, ...spec });
+  // Case-insensitive lookup — "starter" and "Starter" both work
+  const key = Object.keys(PLAN_SPECS).find(
+    k => k.toLowerCase() === req.params.name.toLowerCase()
+  );
+  if (!key) return res.status(404).json({ error: "Plan not found" });
+  const spec = PLAN_SPECS[key];
+  const country = req.headers["cf-ipcountry"] || "IN";
+  const price = country === "IN"
+    ? { currency: "INR", amount: spec.priceInr }
+    : { currency: "USD", amount: Math.round((spec.priceInr / 83) * 100) / 100 };
+  res.json({ name: key, ...spec, price });
 });
 
 // ── GET /api/rates ────────────────────────────────────────────────────────────
