@@ -25,9 +25,8 @@ import { generateAIResponse } from "./lib/ai.js";
 import { shouldTriggerFlow, runFlow, startFlow } from "./lib/flow.js";
 import { calculatePlan } from "./lib/calculator.js";
 import { buildAIContext } from "./lib/config.js";
-import { createTicket, getAllTickets, updateTicketStatus, addReply } from "./lib/tickets.js";
-import { sendTicketEmails, sendReplyEmail } from "./lib/mailer.js";
-import { validateEmail } from "./lib/emailValidator.js";
+import { createTicket, getAllTickets, updateTicketStatus, addReply, clearClosedTickets } from "./lib/tickets.js";
+import { sendTicketEmails, sendReplyEmail } from "./lib/mailer.js";import { validateEmail } from "./lib/emailValidator.js";
 import { startGmailPoller } from "./lib/gmailPoller.js";
 import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
@@ -35,6 +34,7 @@ import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout } from "./lib/userAuth.js";
 import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
+import { createFeedback, getAllFeedback, addFeedbackReply } from "./lib/feedback.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -722,6 +722,36 @@ app.post("/api/servers/:id/stop", requireUser, (req, res) => {
   const stopping = setServerStatus(req.params.id, req.user.id, "stopping");
   setTimeout(() => setServerStatus(req.params.id, req.user.id, "stopped"), 2000);
   res.json(stopping);
+});
+
+// ── POST /api/feedback ────────────────────────────────────────────────────────
+app.post("/api/feedback", (req, res) => {
+  const { ticketId, email, rating, comment } = req.body;
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: "rating must be 1–5" });
+  }
+  const entry = createFeedback({ ticketId, email, rating, comment });
+  res.status(201).json(entry);
+});
+
+// ── GET /api/admin/feedback ───────────────────────────────────────────────────
+app.get("/api/admin/feedback", (_req, res) => {
+  res.json(getAllFeedback());
+});
+
+// ── POST /api/admin/feedback/:id/reply ───────────────────────────────────────
+app.post("/api/admin/feedback/:id/reply", (req, res) => {
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ error: "message is required" });
+  const entry = addFeedbackReply(req.params.id, message.trim());
+  if (!entry) return res.status(404).json({ error: "Feedback not found" });
+  res.json(entry);
+});
+
+// ── DELETE /api/admin/tickets/closed ─────────────────────────────────────────
+app.delete("/api/admin/tickets/closed", (_req, res) => {
+  const result = clearClosedTickets();
+  res.json(result);
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────

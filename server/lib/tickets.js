@@ -65,3 +65,11 @@ export function addReply(id, { from, message }) {
   save(tickets);
   return t;
 }
+
+export function clearClosedTickets() {
+  const tickets = load();
+  const kept = tickets.filter(t => t.status !== "closed");
+  const removed = tickets.length - kept.length;
+  save(kept);
+  return { removed, remaining: kept.length };
+}
