@@ -344,8 +344,15 @@ ${chat_history ? `Conversation context:\n${chat_history}` : ""}`,
 
     const ticket = createTicket({ email, issue: cleanIssue, chat_history: chat_history || "" });
     console.log("[Ticket Created]", ticket.id, email);
-    await sendTicketEmails(ticket);
-    console.log("[Emails Sent]", ticket.id);
+
+    // Send emails — non-fatal: ticket is saved regardless of email success
+    try {
+      await sendTicketEmails(ticket);
+      console.log("[Emails Sent]", ticket.id);
+    } catch (mailErr) {
+      console.warn("[Email Failed — ticket still created]", ticket.id, mailErr?.message || mailErr);
+    }
+
     return res.json({ ticket_id: ticket.id, email: ticket.email, status: "created" });
   } catch (err) {
     console.error("[Ticket Error]", err?.message || err);
