@@ -8,8 +8,12 @@
     "dev": "node --watch server/index.js"
   },
   "dependencies": {
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "express-session": "^1.19.0",
+    "helmet": "^8.1.0",
     "imapflow": "^1.2.18",
     "nodemailer": "^8.0.4",
     "openai": "^6.32.0"

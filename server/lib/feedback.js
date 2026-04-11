@@ -46,3 +46,9 @@ export function addFeedbackReply(id, message) {
   save(items);
   return entry;
 }
+
+export function clearAllFeedback() {
+  const count = load().length;
+  save([]);
+  return { removed: count };
+}

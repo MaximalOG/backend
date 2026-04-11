@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -34,7 +36,7 @@ import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout } from "./lib/userAuth.js";
 import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
-import { createFeedback, getAllFeedback, addFeedbackReply } from "./lib/feedback.js";
+import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -134,7 +136,23 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json());
+
+// Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+
+app.use(express.json({ limit: "2mb" }));
+
+// Rate limiter for auth routes — 10 attempts per minute per IP
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please wait a minute and try again." },
+});
+app.use("/api/auth/login",    authLimiter);
+app.use("/api/auth/signup",   authLimiter);
+app.use("/api/admin/login",   authLimiter);
 
 const MAX_MSG_LENGTH = 500;
 
@@ -413,12 +431,16 @@ app.post("/api/webhook/inbound-email", (req, res) => {
 });
 
 // ── POST /api/admin/login ─────────────────────────────────────────────────────
-app.post("/api/admin/login", (req, res) => {
+app.post("/api/admin/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-  const result = login(username, password);
-  if (!result) return res.status(401).json({ error: "Invalid username or password" });
-  res.json(result);
+  try {
+    const result = await login(username, password);
+    if (!result) return res.status(401).json({ error: "Invalid username or password" });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: "Login failed" });
+  }
 });
 
 app.post("/api/admin/logout", (req, res) => {
@@ -436,15 +458,15 @@ app.get("/api/admin/me", (req, res) => {
 
 app.get("/api/admin/staff", requireAuth, requireOwner, (_req, res) => res.json(getAllStaff()));
 
-app.post("/api/admin/staff", requireAuth, requireOwner, (req, res) => {
+app.post("/api/admin/staff", requireAuth, requireOwner, async (req, res) => {
   const { username, password, permissions } = req.body;
   if (!username || !password) return res.status(400).json({ error: "username and password required" });
-  try { res.json(createStaff({ username, password, permissions })); }
+  try { res.json(await createStaff({ username, password, permissions })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.patch("/api/admin/staff/:id", requireAuth, requireOwner, (req, res) => {
-  try { res.json(updateStaff(req.params.id, req.body)); }
+app.patch("/api/admin/staff/:id", requireAuth, requireOwner, async (req, res) => {
+  try { res.json(await updateStaff(req.params.id, req.body)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -529,6 +551,7 @@ app.post("/api/create-order", async (req, res) => {
   let couponLabel = null;
 
   if (couponCode && couponCode.trim()) {
+    // Explicit coupon code provided — validate it
     const coupon = validateCode(couponCode.trim());
     if (coupon) {
       if (coupon.discountType === "percent") {
@@ -541,11 +564,27 @@ app.post("/api/create-order", async (req, res) => {
     } else {
       console.log(`[Order] Coupon invalid or expired: ${couponCode}`);
     }
+  } else {
+    // No explicit code — check if a public banner sale is active and apply it automatically
+    const activeSale = getActiveSale();
+    if (activeSale && activeSale.mode === "public" && activeSale.enabled) {
+      const plansApply = activeSale.plans === "all" ||
+        (Array.isArray(activeSale.plans) && activeSale.plans.includes(planKey));
+      if (plansApply) {
+        if (activeSale.discountType === "percent") {
+          discountAmount = Math.round(originalPrice * (activeSale.discount / 100));
+        } else {
+          discountAmount = Math.min(activeSale.discount, originalPrice);
+        }
+        couponLabel = activeSale.label;
+        console.log(`[Order] Public sale applied: ${activeSale.label} | Discount: ₹${discountAmount}`);
+      }
+    }
   }
 
   // 3. Calculate final price
   const finalPrice = Math.max(0, originalPrice - discountAmount);
-  console.log(`[Order] Discount: ₹${discountAmount} | Final: ₹${finalPrice}`);
+  console.log(`[Order] Original: ₹${originalPrice} | Discount: ₹${discountAmount} | Final: ₹${finalPrice}`);
 
   if (finalPrice === 0) {
     return res.status(400).json({ error: "Coupon makes this plan free — no payment needed." });
@@ -739,12 +778,58 @@ app.get("/api/admin/feedback", (_req, res) => {
   res.json(getAllFeedback());
 });
 
+// ── DELETE /api/admin/feedback ────────────────────────────────────────────────
+app.delete("/api/admin/feedback", requireAuth, requireOwner, (_req, res) => {
+  const result = clearAllFeedback();
+  res.json(result);
+});
+
 // ── POST /api/admin/feedback/:id/reply ───────────────────────────────────────
-app.post("/api/admin/feedback/:id/reply", (req, res) => {
+app.post("/api/admin/feedback/:id/reply", async (req, res) => {
   const { message } = req.body;
   if (!message?.trim()) return res.status(400).json({ error: "message is required" });
+
   const entry = addFeedbackReply(req.params.id, message.trim());
   if (!entry) return res.status(404).json({ error: "Feedback not found" });
+
+  // Send email to user if they provided one
+  if (entry.email) {
+    try {
+      const nodemailer = await import("nodemailer");
+      const transport = nodemailer.default.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: false,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+
+      const stars = "⭐".repeat(entry.rating);
+      await transport.sendMail({
+        from: `"NetherNodes Support" <${process.env.SMTP_USER}>`,
+        to: entry.email,
+        subject: `A follow-up on your feedback — NetherNodes`,
+        html: `
+          <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <div style="background:#1a0a0a;padding:20px;border-radius:8px 8px 0 0">
+              <h2 style="color:#e53935;margin:0">NetherNodes Support</h2>
+            </div>
+            <div style="background:#111;padding:20px;color:#ddd;border-radius:0 0 8px 8px">
+              <p>Hi there,</p>
+              <p>Our team has a follow-up question regarding your recent feedback (${stars}):</p>
+              ${entry.comment ? `<p style="background:#1a1a1a;padding:12px;border-radius:4px;border-left:3px solid #555;color:#aaa;font-style:italic">"${entry.comment}"</p>` : ""}
+              <div style="background:#1a1a1a;border-left:4px solid #e53935;padding:16px;border-radius:4px;margin:16px 0;white-space:pre-wrap;font-size:14px;line-height:1.6">${message.trim()}</div>
+              <p>You can reply directly to this email and we'll get back to you.</p>
+              <p style="color:#888;font-size:12px;margin-top:24px">— NetherNodes Support Team</p>
+            </div>
+          </div>
+        `,
+      });
+      console.log("[Feedback Reply] Email sent to", entry.email);
+    } catch (mailErr) {
+      console.warn("[Feedback Reply] Email failed:", mailErr?.message || mailErr);
+    }
+  }
+
   res.json(entry);
 });
 
