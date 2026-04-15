@@ -15,7 +15,11 @@
     "express-session": "^1.19.0",
     "helmet": "^8.1.0",
     "imapflow": "^1.2.18",
+    "jsonwebtoken": "^9.0.3",
     "nodemailer": "^8.0.4",
-    "openai": "^6.32.0"
+    "openai": "^6.32.0",
+    "passport": "^0.7.0",
+    "passport-discord": "^0.1.4",
+    "passport-google-oauth20": "^2.0.0"
   }
 }

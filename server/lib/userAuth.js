@@ -1,7 +1,7 @@
 /**
  * User authentication — production-ready.
- * bcrypt for password hashing, Bearer tokens for sessions.
- * Persists users to data/users_app.json.
+ * JWT tokens, bcrypt (10 rounds), email verification, password reset.
+ * File-based persistence (data/users_app.json).
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -9,14 +9,15 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH   = resolve(__dirname, "../../data/users_app.json");
-const BCRYPT_ROUNDS = 12;
-const SESSION_TTL   = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-// In-memory session store: token → { userId, expiresAt }
-const USER_SESSIONS = new Map();
+const __dirname     = dirname(fileURLToPath(import.meta.url));
+const DB_PATH       = resolve(__dirname, "../../data/users_app.json");
+const BCRYPT_ROUNDS = 10;
+const JWT_SECRET    = process.env.JWT_SECRET || "nn_dev_secret_change_in_production";
+const JWT_EXPIRES   = "7d";
+const VERIFY_TTL    = 24 * 60 * 60 * 1000;   // 24 hours
+const RESET_TTL     = 30 * 60 * 1000;         // 30 minutes
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 function loadUsers() {
@@ -31,49 +32,136 @@ function saveUsers(users) {
   writeFileSync(DB_PATH, JSON.stringify(users, null, 2), "utf-8");
 }
 
-// ── Validation helpers ────────────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────────
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email).trim());
 }
 
-function sanitizeName(name) {
-  return String(name).trim().replace(/[<>"']/g, "").slice(0, 80);
+function isValidUsername(username) {
+  return /^[a-zA-Z0-9_]{3,20}$/.test(String(username));
+}
+
+function validatePassword(password) {
+  if (!password || password.length < 8)       return "Password must be at least 8 characters.";
+  if (!/[A-Z]/.test(password))                return "Password must contain at least one uppercase letter.";
+  if (!/[a-z]/.test(password))                return "Password must contain at least one lowercase letter.";
+  if (!/[0-9]/.test(password))                return "Password must contain at least one number.";
+  return null; // valid
+}
+
+function sanitize(str, maxLen = 80) {
+  return String(str).trim().replace(/[<>"'`]/g, "").slice(0, maxLen);
+}
+
+// ── JWT helpers ───────────────────────────────────────────────────────────────
+function signToken(userId) {
+  return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+}
+
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); }
+  catch { return null; }
+}
+
+// ── Public user shape (never expose passwordHash) ─────────────────────────────
+function publicUser(user) {
+  return {
+    id:            user.id,
+    name:          user.name,
+    username:      user.username,
+    email:         user.email,
+    emailVerified: user.emailVerified,
+  };
 }
 
 // ── Signup ────────────────────────────────────────────────────────────────────
-export async function userSignup(name, email, password) {
-  // Input validation
-  if (!name || !email || !password) throw new Error("Name, email and password are required.");
-  if (!isValidEmail(email))         throw new Error("Please enter a valid email address.");
-  if (password.length < 6)          throw new Error("Password must be at least 6 characters.");
+export async function userSignup(name, username, email, password) {
+  if (!name || !username || !email || !password)
+    throw new Error("Name, username, email and password are required.");
 
-  const cleanEmail = email.trim().toLowerCase();
-  const cleanName  = sanitizeName(name);
+  if (!isValidEmail(email))
+    throw new Error("Please enter a valid email address.");
+
+  if (!isValidUsername(username))
+    throw new Error("Username must be 3–20 characters and only contain letters, numbers, or underscores.");
+
+  const pwError = validatePassword(password);
+  if (pwError) throw new Error(pwError);
+
+  const cleanEmail    = email.trim().toLowerCase();
+  const cleanUsername = username.trim().toLowerCase();
+  const cleanName     = sanitize(name);
 
   const users = loadUsers();
-  if (users.find(u => u.email === cleanEmail)) {
-    throw new Error("An account with this email already exists.");
-  }
 
-  // bcrypt hash — never store plain text
-  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  if (users.find(u => u.email === cleanEmail))
+    throw new Error("Email already registered.");
+
+  if (users.find(u => u.username === cleanUsername))
+    throw new Error("Username already taken.");
+
+  const passwordHash        = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const verificationToken   = crypto.randomBytes(32).toString("hex");
+  const verificationExpires = new Date(Date.now() + VERIFY_TTL).toISOString();
 
   const user = {
-    id:           `user_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`,
-    name:         cleanName,
-    email:        cleanEmail,
+    id:                 `user_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`,
+    name:               cleanName,
+    username:           cleanUsername,
+    email:              cleanEmail,
     passwordHash,
-    emailVerified: false, // placeholder for future email verification
-    createdAt:    new Date().toISOString(),
+    emailVerified:      false,
+    verificationToken,
+    verificationExpires,
+    resetToken:         null,
+    resetExpires:       null,
+    provider:           "local",
+    createdAt:          new Date().toISOString(),
   };
 
   users.push(user);
   saveUsers(users);
 
-  console.log(`[Auth] Signup: ${cleanEmail} (${user.id})`);
+  console.log(`[Auth] Signup: ${cleanEmail} (@${cleanUsername})`);
 
-  const token = _createSession(user.id);
-  return { token, user: _publicUser(user) };
+  return {
+    token: signToken(user.id),
+    user:  publicUser(user),
+    verificationToken, // returned so the route can send the email
+  };
+}
+
+// ── Verify email ──────────────────────────────────────────────────────────────
+export function verifyEmail(token) {
+  const users = loadUsers();
+  const user  = users.find(u => u.verificationToken === token);
+
+  if (!user)                                          throw new Error("Invalid verification link.");
+  if (new Date(user.verificationExpires) < new Date()) throw new Error("Verification link has expired. Please request a new one.");
+  if (user.emailVerified)                             return publicUser(user); // already verified
+
+  user.emailVerified      = true;
+  user.verificationToken  = null;
+  user.verificationExpires = null;
+  saveUsers(users);
+
+  console.log(`[Auth] Email verified: ${user.email}`);
+  return publicUser(user);
+}
+
+// ── Resend verification ───────────────────────────────────────────────────────
+export function resendVerification(email) {
+  const users = loadUsers();
+  const user  = users.find(u => u.email === email.trim().toLowerCase());
+
+  if (!user)              throw new Error("No account found with that email.");
+  if (user.emailVerified) throw new Error("Email is already verified.");
+
+  user.verificationToken   = crypto.randomBytes(32).toString("hex");
+  user.verificationExpires = new Date(Date.now() + VERIFY_TTL).toISOString();
+  saveUsers(users);
+
+  return { verificationToken: user.verificationToken, email: user.email, name: user.name };
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
@@ -82,40 +170,76 @@ export async function userLogin(email, password) {
   if (!isValidEmail(email)) throw new Error("Please enter a valid email address.");
 
   const cleanEmail = email.trim().toLowerCase();
-  const users = loadUsers();
-  const user  = users.find(u => u.email === cleanEmail);
+  const users      = loadUsers();
+  const user       = users.find(u => u.email === cleanEmail);
 
-  // Use bcrypt.compare — timing-safe, works with both old SHA256 and new bcrypt hashes
   const valid = user && await bcrypt.compare(password, user.passwordHash).catch(() => false);
-
   if (!valid) {
-    console.warn(`[Auth] Failed login attempt: ${cleanEmail}`);
+    console.warn(`[Auth] Failed login: ${cleanEmail}`);
     throw new Error("Invalid email or password.");
   }
 
+  if (!user.emailVerified) {
+    console.warn(`[Auth] Unverified login attempt: ${cleanEmail}`);
+    throw new Error("Please verify your email before logging in. Check your inbox.");
+  }
+
   console.log(`[Auth] Login: ${cleanEmail}`);
-  const token = _createSession(user.id);
-  return { token, user: _publicUser(user) };
+  return { token: signToken(user.id), user: publicUser(user) };
 }
 
-// ── Logout ────────────────────────────────────────────────────────────────────
-export function userLogout(token) {
-  USER_SESSIONS.delete(token);
+// ── Logout (JWT is stateless — client just discards token) ────────────────────
+export function userLogout() {
+  // Nothing to do server-side with JWT.
+  // For token blacklisting, add a Redis/DB store here in future.
 }
 
-// ── Token verification ────────────────────────────────────────────────────────
+// ── Get user from JWT ─────────────────────────────────────────────────────────
 export function getUserFromToken(token) {
   if (!token) return null;
-  const session = USER_SESSIONS.get(token);
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) {
-    USER_SESSIONS.delete(token);
-    return null;
-  }
+  const payload = verifyToken(token);
+  if (!payload) return null;
+
   const users = loadUsers();
-  const user  = users.find(u => u.id === session.userId);
+  const user  = users.find(u => u.id === payload.sub);
   if (!user) return null;
-  return _publicUser(user);
+  return publicUser(user);
+}
+
+// ── Forgot password ───────────────────────────────────────────────────────────
+export function forgotPassword(email) {
+  const users = loadUsers();
+  const user  = users.find(u => u.email === email.trim().toLowerCase());
+
+  // Always return success to prevent email enumeration
+  if (!user) return null;
+
+  user.resetToken   = crypto.randomBytes(32).toString("hex");
+  user.resetExpires = new Date(Date.now() + RESET_TTL).toISOString();
+  saveUsers(users);
+
+  console.log(`[Auth] Password reset requested: ${user.email}`);
+  return { resetToken: user.resetToken, email: user.email, name: user.name };
+}
+
+// ── Reset password ────────────────────────────────────────────────────────────
+export async function resetPassword(token, newPassword) {
+  const pwError = validatePassword(newPassword);
+  if (pwError) throw new Error(pwError);
+
+  const users = loadUsers();
+  const user  = users.find(u => u.resetToken === token);
+
+  if (!user)                                    throw new Error("Invalid or expired reset link.");
+  if (new Date(user.resetExpires) < new Date()) throw new Error("Reset link has expired. Please request a new one.");
+
+  user.passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  user.resetToken   = null;
+  user.resetExpires = null;
+  saveUsers(users);
+
+  console.log(`[Auth] Password reset: ${user.email}`);
+  return publicUser(user);
 }
 
 // ── Express middleware ────────────────────────────────────────────────────────
@@ -126,15 +250,4 @@ export function requireUser(req, res, next) {
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   req.user = user;
   next();
-}
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
-function _createSession(userId) {
-  const token = crypto.randomBytes(32).toString("hex");
-  USER_SESSIONS.set(token, { userId, expiresAt: Date.now() + SESSION_TTL });
-  return token;
-}
-
-function _publicUser(user) {
-  return { id: user.id, name: user.name, email: user.email };
 }

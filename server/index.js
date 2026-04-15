@@ -34,9 +34,11 @@ import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
-import { userSignup, userLogin, getUserFromToken, requireUser, userLogout } from "./lib/userAuth.js";
+import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword } from "./lib/userAuth.js";
+import { googleAuth, googleCallback, discordAuth, discordCallback, passport as oauthPassport } from "./lib/oauth.js";
 import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
+import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -141,6 +143,7 @@ app.use(cors({
 app.use(helmet({ contentSecurityPolicy: false }));
 
 app.use(express.json({ limit: "2mb" }));
+app.use(oauthPassport.initialize());
 
 // Rate limiter for auth routes — 10 attempts per minute per IP
 const authLimiter = rateLimit({
@@ -611,17 +614,29 @@ app.post("/api/create-order", async (req, res) => {
 });
 
 // ── POST /api/verify-payment ──────────────────────────────────────────────────
-app.post("/api/verify-payment", (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planName, userEmail } = req.body;
+app.post("/api/verify-payment", async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planName, userEmail, originalPrice, discountAmount, finalPrice, couponLabel } = req.body;
   if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
     return res.status(400).json({ error: "Missing payment verification fields" });
   }
 
   const secret = process.env.RAZORPAY_KEY_SECRET;
   if (!secret || secret === "REPLACE_ME") {
-    // Dev mode — mock verification
+    // Dev mode — mock verification + invoice
     console.log("[Payment] Mock verification for", planName, userEmail);
-    return res.json({ verified: true, mock: true, planName, userEmail });
+    const planSpec = PLAN_SPECS[planName] || {};
+    const invoice = await createAndSendInvoice({
+      userEmail, planName,
+      planRam: planSpec.ram || "N/A",
+      originalPrice: originalPrice || planSpec.priceInr || 0,
+      discountAmount: discountAmount || 0,
+      finalPrice: finalPrice || planSpec.priceInr || 0,
+      currency: "INR",
+      razorpayPaymentId: razorpay_payment_id,
+      razorpayOrderId: razorpay_order_id,
+      couponLabel,
+    });
+    return res.json({ verified: true, mock: true, planName, userEmail, orderId: invoice.orderId });
   }
 
   const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -632,8 +647,50 @@ app.post("/api/verify-payment", (req, res) => {
   }
 
   console.log("[Payment] Verified:", razorpay_payment_id, "for", planName, userEmail);
-  // TODO: provision server, save to DB, send confirmation email
-  res.json({ verified: true, mock: false, planName, userEmail, paymentId: razorpay_payment_id });
+
+  // Generate invoice and send email
+  const planSpec = PLAN_SPECS[planName] || {};
+  const invoice = await createAndSendInvoice({
+    userEmail, planName,
+    planRam: planSpec.ram || "N/A",
+    originalPrice: originalPrice || planSpec.priceInr || 0,
+    discountAmount: discountAmount || 0,
+    finalPrice: finalPrice || planSpec.priceInr || 0,
+    currency: "INR",
+    razorpayPaymentId: razorpay_payment_id,
+    razorpayOrderId: razorpay_order_id,
+    couponLabel,
+  });
+
+  res.json({ verified: true, mock: false, planName, userEmail, paymentId: razorpay_payment_id, orderId: invoice.orderId });
+});
+
+// ── POST /api/resend-invoice ──────────────────────────────────────────────────
+app.post("/api/resend-invoice", async (req, res) => {
+  const { orderId } = req.body;
+  if (!orderId) return res.status(400).json({ error: "orderId is required" });
+
+  const invoice = getInvoiceById(orderId.trim());
+  if (!invoice) return res.status(404).json({ error: "Invoice not found. Please check your Order ID." });
+
+  try {
+    await createAndSendInvoice({
+      userEmail:        invoice.userEmail,
+      planName:         invoice.planName,
+      planRam:          invoice.planRam,
+      originalPrice:    invoice.originalPrice,
+      discountAmount:   invoice.discountAmount,
+      finalPrice:       invoice.finalPrice,
+      currency:         invoice.currency,
+      razorpayPaymentId: invoice.razorpayPaymentId,
+      razorpayOrderId:  invoice.razorpayOrderId,
+      couponLabel:      invoice.couponLabel,
+    });
+    console.log(`[Invoice] Resent ${orderId} to ${invoice.userEmail}`);
+    res.json({ ok: true, email: invoice.userEmail });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to resend invoice." });
+  }
 });
 
 // ── GET /api/sale ─────────────────────────────────────────────────────────────
@@ -698,22 +755,106 @@ app.patch("/api/admin/tickets/:id", (req, res) => {
   res.json(ticket);
 });
 
+// ── GET /api/auth/google ──────────────────────────────────────────────────────
+app.get("/api/auth/google", googleAuth);
+app.get("/api/auth/google/callback", ...googleCallback);
+
+// ── GET /api/auth/discord ─────────────────────────────────────────────────────
+app.get("/api/auth/discord", discordAuth);
+app.get("/api/auth/discord/callback", ...discordCallback);
+
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
-app.post("/api/auth/signup", (req, res) => {
-  const { name, email, password } = req.body;
+app.post("/api/auth/signup", async (req, res) => {
+  const { name, username, email, password } = req.body;
   try {
-    const result = userSignup(name, email, password);
-    res.status(201).json(result);
+    const result = await userSignup(name, username, email, password);
+
+    // Send verification email (non-fatal)
+    const verifyUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/verify-email?token=${result.verificationToken}`;
+    try {
+      const nodemailer = await import("nodemailer");
+      const transport = nodemailer.default.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: false,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      await transport.sendMail({
+        from: `"NetherNodes" <${process.env.SMTP_USER}>`,
+        to: result.user.email,
+        subject: "Verify your NetherNodes account",
+        html: `
+          <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <div style="background:#1a0a0a;padding:20px;border-radius:8px 8px 0 0">
+              <h2 style="color:#e53935;margin:0">Welcome to NetherNodes 🔥</h2>
+            </div>
+            <div style="background:#111;padding:20px;color:#ddd;border-radius:0 0 8px 8px">
+              <p>Hi ${result.user.name},</p>
+              <p>Click the button below to verify your email address. This link expires in 24 hours.</p>
+              <a href="${verifyUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#e53935;color:white;text-decoration:none;border-radius:4px;font-weight:bold">Verify Email</a>
+              <p style="color:#888;font-size:12px">Or copy this link: ${verifyUrl}</p>
+              <p style="color:#888;font-size:12px;margin-top:24px">— NetherNodes Team</p>
+            </div>
+          </div>
+        `,
+      });
+    } catch (mailErr) {
+      console.warn("[Auth] Verification email failed:", mailErr?.message);
+    }
+
+    res.status(201).json({ token: result.token, user: result.user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── GET /api/auth/verify-email ────────────────────────────────────────────────
+app.get("/api/auth/verify-email", (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: "Token is required." });
+  try {
+    const user = verifyEmail(token);
+    res.json({ message: "Email verified successfully.", user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── POST /api/auth/resend-verification ───────────────────────────────────────
+app.post("/api/auth/resend-verification", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required." });
+  try {
+    const result = resendVerification(email);
+    const verifyUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/verify-email?token=${result.verificationToken}`;
+    try {
+      const nodemailer = await import("nodemailer");
+      const transport = nodemailer.default.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: false,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      await transport.sendMail({
+        from: `"NetherNodes" <${process.env.SMTP_USER}>`,
+        to: result.email,
+        subject: "Verify your NetherNodes account",
+        html: `<p>Hi ${result.name},</p><p><a href="${verifyUrl}">Click here to verify your email</a> (expires in 24 hours).</p>`,
+      });
+    } catch (mailErr) {
+      console.warn("[Auth] Resend verification email failed:", mailErr?.message);
+    }
+    res.json({ message: "Verification email sent." });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const result = userLogin(email, password);
+    const result = await userLogin(email, password);
     res.json(result);
   } catch (err) {
     res.status(401).json({ error: err.message });
@@ -727,10 +868,63 @@ app.get("/api/auth/me", requireUser, (req, res) => {
 
 // ── POST /api/auth/logout ─────────────────────────────────────────────────────
 app.post("/api/auth/logout", (req, res) => {
-  const authHeader = req.headers.authorization || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  if (token) userLogout(token);
+  userLogout();
   res.json({ ok: true });
+});
+
+// ── POST /api/auth/forgot-password ───────────────────────────────────────────
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required." });
+
+  // Always return 200 to prevent email enumeration
+  const result = forgotPassword(email);
+  if (result) {
+    const resetUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/reset-password?token=${result.resetToken}`;
+    try {
+      const nodemailer = await import("nodemailer");
+      const transport = nodemailer.default.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: false,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      await transport.sendMail({
+        from: `"NetherNodes" <${process.env.SMTP_USER}>`,
+        to: result.email,
+        subject: "Reset your NetherNodes password",
+        html: `
+          <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <div style="background:#1a0a0a;padding:20px;border-radius:8px 8px 0 0">
+              <h2 style="color:#e53935;margin:0">Password Reset</h2>
+            </div>
+            <div style="background:#111;padding:20px;color:#ddd;border-radius:0 0 8px 8px">
+              <p>Hi ${result.name},</p>
+              <p>Click the button below to reset your password. This link expires in 30 minutes.</p>
+              <a href="${resetUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#e53935;color:white;text-decoration:none;border-radius:4px;font-weight:bold">Reset Password</a>
+              <p style="color:#888;font-size:12px">If you didn't request this, ignore this email.</p>
+            </div>
+          </div>
+        `,
+      });
+    } catch (mailErr) {
+      console.warn("[Auth] Reset email failed:", mailErr?.message);
+    }
+  }
+
+  res.json({ message: "If an account exists with that email, a reset link has been sent." });
+});
+
+// ── POST /api/auth/reset-password ────────────────────────────────────────────
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ error: "Token and password are required." });
+  try {
+    const user = await resetPassword(token, password);
+    res.json({ message: "Password reset successfully.", user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ── GET /api/servers ──────────────────────────────────────────────────────────
