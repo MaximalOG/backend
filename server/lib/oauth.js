@@ -139,11 +139,70 @@ passport.deserializeUser((id, done) => {
 
 // ── Route handlers (called from index.js) ────────────────────────────────────
 
+let _initialized = false;
+function ensureInit() {
+  if (_initialized) return;
+  _initialized = true;
+
+  const apiBase = process.env.API_URL || "http://localhost:3001";
+
+  passport.use(new GoogleStrategy(
+    {
+      clientID:     process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL:  `${apiBase}/api/auth/google/callback`,
+    },
+    (_at, _rt, profile, done) => {
+      try {
+        const user = findOrCreate({
+          provider: "google", providerId: profile.id,
+          email: profile.emails?.[0]?.value || null,
+          name: profile.displayName,
+          avatar: profile.photos?.[0]?.value || null,
+        });
+        done(null, user);
+      } catch (err) { done(err); }
+    }
+  ));
+
+  passport.use(new DiscordStrategy(
+    {
+      clientID:     process.env.DISCORD_CLIENT_ID,
+      clientSecret: process.env.DISCORD_CLIENT_SECRET,
+      callbackURL:  `${apiBase}/api/auth/discord/callback`,
+      scope:        ["identify", "email"],
+    },
+    (_at, _rt, profile, done) => {
+      try {
+        const avatar = profile.avatar
+          ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png`
+          : null;
+        const user = findOrCreate({
+          provider: "discord", providerId: profile.id,
+          email: profile.email || null,
+          name: profile.username,
+          avatar,
+        });
+        done(null, user);
+      } catch (err) { done(err); }
+    }
+  ));
+
+  passport.serializeUser((user, done) => done(null, user.id));
+  passport.deserializeUser((id, done) => {
+    done(null, loadUsers().find(u => u.id === id) || null);
+  });
+}
+
 /** Redirect user to Google consent screen */
-export const googleAuth = passport.authenticate("google", { scope: ["profile", "email"], session: false });
+export const googleAuth = (req, res, next) => {
+  ensureInit();
+  passport.authenticate("google", { scope: ["profile", "email"], session: false })(req, res, next);
+};
 
 /** Handle Google callback — redirect to frontend with token */
 export const googleCallback = [
+  (req, res, next) => { ensureInit(); next(); },
   passport.authenticate("google", { session: false, failureRedirect: `${FRONTEND}/login?error=google_failed` }),
   (req, res) => {
     const token = signToken(req.user.id);
@@ -153,10 +212,14 @@ export const googleCallback = [
 ];
 
 /** Redirect user to Discord consent screen */
-export const discordAuth = passport.authenticate("discord", { session: false });
+export const discordAuth = (req, res, next) => {
+  ensureInit();
+  passport.authenticate("discord", { session: false })(req, res, next);
+};
 
 /** Handle Discord callback — redirect to frontend with token */
 export const discordCallback = [
+  (req, res, next) => { ensureInit(); next(); },
   passport.authenticate("discord", { session: false, failureRedirect: `${FRONTEND}/login?error=discord_failed` }),
   (req, res) => {
     const token = signToken(req.user.id);
