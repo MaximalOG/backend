@@ -35,7 +35,6 @@ import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js"
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword } from "./lib/userAuth.js";
-import { googleAuth, googleCallback, discordAuth, discordCallback, passport as oauthPassport } from "./lib/oauth.js";
 import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
@@ -143,7 +142,6 @@ app.use(cors({
 app.use(helmet({ contentSecurityPolicy: false }));
 
 app.use(express.json({ limit: "2mb" }));
-app.use(oauthPassport.initialize());
 
 // Rate limiter for auth routes — 10 attempts per minute per IP
 const authLimiter = rateLimit({
@@ -755,14 +753,6 @@ app.patch("/api/admin/tickets/:id", (req, res) => {
   res.json(ticket);
 });
 
-// ── GET /api/auth/google ──────────────────────────────────────────────────────
-app.get("/api/auth/google", googleAuth);
-app.get("/api/auth/google/callback", ...googleCallback);
-
-// ── GET /api/auth/discord ─────────────────────────────────────────────────────
-app.get("/api/auth/discord", discordAuth);
-app.get("/api/auth/discord/callback", ...discordCallback);
-
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
 app.post("/api/auth/signup", async (req, res) => {
   const { name, username, email, password } = req.body;
@@ -852,9 +842,10 @@ app.post("/api/auth/resend-verification", async (req, res) => {
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, identifier, password } = req.body;
+  // Accept either "identifier" (new) or "email" (legacy) field
   try {
-    const result = await userLogin(email, password);
+    const result = await userLogin(identifier || email, password);
     res.json(result);
   } catch (err) {
     res.status(401).json({ error: err.message });

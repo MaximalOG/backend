@@ -165,26 +165,30 @@ export function resendVerification(email) {
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
-export async function userLogin(email, password) {
-  if (!email || !password) throw new Error("Email and password are required.");
-  if (!isValidEmail(email)) throw new Error("Please enter a valid email address.");
+export async function userLogin(identifier, password) {
+  if (!identifier || !password) throw new Error("Email/username and password are required.");
 
-  const cleanEmail = email.trim().toLowerCase();
-  const users      = loadUsers();
-  const user       = users.find(u => u.email === cleanEmail);
+  const cleanIdentifier = identifier.trim().toLowerCase();
+  const users = loadUsers();
+
+  // Match by email OR username
+  const user = users.find(u =>
+    u.email === cleanIdentifier ||
+    u.username === cleanIdentifier
+  );
 
   const valid = user && await bcrypt.compare(password, user.passwordHash).catch(() => false);
   if (!valid) {
-    console.warn(`[Auth] Failed login: ${cleanEmail}`);
-    throw new Error("Invalid email or password.");
+    console.warn(`[Auth] Failed login: ${cleanIdentifier}`);
+    throw new Error("Invalid email/username or password.");
   }
 
   if (!user.emailVerified) {
-    console.warn(`[Auth] Unverified login attempt: ${cleanEmail}`);
+    console.warn(`[Auth] Unverified login attempt: ${cleanIdentifier}`);
     throw new Error("Please verify your email before logging in. Check your inbox.");
   }
 
-  console.log(`[Auth] Login: ${cleanEmail}`);
+  console.log(`[Auth] Login: ${user.email} (@${user.username})`);
   return { token: signToken(user.id), user: publicUser(user) };
 }
 
