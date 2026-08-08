@@ -1,0 +1,17 @@
+{
+  "users": [
+    {
+      "id": "owner",
+      "username": "Maximal",
+      "passwordHash": "eddc1ef3f9f406980d4b6d782a69076a8ecba4ac30a4e28a0a0e5e308def37f3",
+      "role": "owner",
+      "permissions": [
+        "tickets",
+        "banner_sale",
+        "promo_codes",
+        "staff_management"
+      ],
+      "createdAt": "2026-04-05T07:03:33.026Z"
+    }
+  ]
+}
