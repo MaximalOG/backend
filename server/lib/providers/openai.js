@@ -2,14 +2,21 @@ import OpenAI from "openai";
 import { buildSystemPrompt } from "../prompt.js";
 
 let client = null;
+let _lastKey = null;
+
 function getClient() {
+  const apiKey = process.env.OPENAI_API_KEY || "";
+  // Reset client if key changed (e.g. after restart with new env)
+  if (client && apiKey !== _lastKey) client = null;
   if (!client) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    const isOpenRouter = (apiKey || "").startsWith("sk-or-");
-    client = new OpenAI({
-      apiKey,
-      ...(isOpenRouter && { baseURL: "https://openrouter.ai/api/v1" }),
-    });
+    _lastKey = apiKey;
+    let baseURL;
+    if (apiKey.startsWith("sk-or-")) {
+      baseURL = "https://openrouter.ai/api/v1";
+    } else if (apiKey.startsWith("nvapi-")) {
+      baseURL = "https://integrate.api.nvidia.com/v1";
+    }
+    client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
   }
   return client;
 }
