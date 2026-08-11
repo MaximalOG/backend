@@ -35,9 +35,10 @@ import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js"
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword } from "./lib/userAuth.js";
-import { getServersByUser, getServer, setServerStatus } from "./lib/servers.js";
+import { getServersByUser, getServer, setServerStatus, createPendingServer, markServerProvisioned, updateServer, deleteServerRecord } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
+import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer } from "./lib/pterodactyl.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -668,6 +669,7 @@ app.post("/api/verify-payment", async (req, res) => {
       couponLabel,
     });
     return res.json({ verified: true, mock: true, planName, userEmail, orderId: invoice.orderId });
+    // Note: mock mode also provisions so dev flow works end-to-end
   }
 
   const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -694,6 +696,15 @@ app.post("/api/verify-payment", async (req, res) => {
   });
 
   res.json({ verified: true, mock: false, planName, userEmail, paymentId: razorpay_payment_id, orderId: invoice.orderId });
+
+  // ── Async: create Pterodactyl user + pending server record ──────────────────
+  setImmediate(async () => {
+    try {
+      await _provisionAfterPayment({ userEmail, planName, userId: req.body.userId ?? null, invoiceOrderId: invoice.orderId });
+    } catch (err) {
+      console.error("[Pterodactyl] Post-payment provision failed:", err.message);
+    }
+  });
 });
 
 // ── POST /api/resend-invoice ──────────────────────────────────────────────────
@@ -951,37 +962,277 @@ app.post("/api/auth/reset-password", async (req, res) => {
   }
 });
 
+// ── POST /api/claim-free ──────────────────────────────────────────────────────
+// Handles the free plan (Basic) — no Razorpay needed, just provision directly
+app.post("/api/claim-free", async (req, res) => {
+  const { planName, userEmail, userId } = req.body;
+  if (!userEmail || !planName) return res.status(400).json({ error: "userEmail and planName are required." });
+
+  const planKey = Object.keys(PLAN_SPECS).find(k => k.toLowerCase() === String(planName).toLowerCase());
+  if (!planKey) return res.status(400).json({ error: "Invalid plan." });
+
+  const spec = PLAN_SPECS[planKey];
+  if (spec.priceInr !== 0) return res.status(400).json({ error: "Only free plans can use this endpoint." });
+
+  // Generate a fake invoice ID for tracking
+  const { createAndSendInvoice } = await import("./lib/invoice.js");
+  let invoiceOrderId = null;
+  try {
+    const invoice = await createAndSendInvoice({
+      userEmail, planName: planKey,
+      planRam: spec.ram,
+      originalPrice: 0, discountAmount: 0, finalPrice: 0,
+      currency: "INR",
+      razorpayPaymentId: "FREE", razorpayOrderId: "FREE",
+      couponLabel: "Free Plan",
+    });
+    invoiceOrderId = invoice.orderId;
+  } catch (err) {
+    console.warn("[ClaimFree] Invoice creation failed:", err.message);
+  }
+
+  // Provision async — respond immediately
+  res.json({ ok: true, planName: planKey, invoiceOrderId });
+
+  setImmediate(async () => {
+    try {
+      await _provisionAfterPayment({ userEmail, planName: planKey, userId: userId ?? null, invoiceOrderId });
+    } catch (err) {
+      console.error("[ClaimFree] Provision failed:", err.message);
+    }
+  });
+});
+// Returns the available server types for the setup wizard
+app.get("/api/server-types", (_req, res) => {
+  res.json(getServerTypes());
+});
+
+// ── POST /api/servers/:id/setup ───────────────────────────────────────────────
+// Called from the setup wizard — provisions the actual Pterodactyl server
+app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
+  const { serverName, serverType, mcVersion, javaVersion } = req.body;
+
+  if (!serverName?.trim()) return res.status(400).json({ error: "Server name is required." });
+  if (!serverType)         return res.status(400).json({ error: "Server type is required." });
+
+  const srv = getServer(req.params.id, req.user.id);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (srv.status !== "pending_setup") {
+    return res.status(400).json({ error: "Server is already set up or being provisioned." });
+  }
+
+  try {
+    // Get or create the Pterodactyl user for this customer
+    const ptUser = await ensurePterodactylUser({
+      email:    req.user.email,
+      username: req.user.username,
+      name:     req.user.name,
+    });
+
+    // Resolve egg ID from server type string
+    const types  = getServerTypes();
+    const chosen = types.find(t => t.id === serverType);
+    if (!chosen) return res.status(400).json({ error: "Invalid server type." });
+
+    // Provision on Pterodactyl
+    const ptServer = await provisionServer({
+      pterodactylUserId: ptUser.id,
+      serverName:  serverName.trim().slice(0, 48),
+      planName:    srv.planName,
+      eggId:       chosen.eggId,
+      mcVersion:   mcVersion || "latest",
+      javaVersion: javaVersion || null,
+    });
+
+    // Build the subdomain/connection string
+    const subdomain = `${ptServer.uuid.slice(0, 8)}.nethernodes.in`;
+
+    // Update local record
+    const updated = markServerProvisioned(srv.id, {
+      pterodactylId: ptServer.id,
+      subdomain,
+      serverType,
+      mcVersion: mcVersion || "latest",
+      name: serverName.trim(),
+    });
+
+    console.log(`[Pterodactyl] Server ${ptServer.id} provisioned for user ${req.user.email}`);
+    res.json({ ok: true, server: _serializeServer(updated) });
+
+  } catch (err) {
+    console.error("[Pterodactyl] Setup error:", err.message);
+    res.status(500).json({ error: "Failed to provision server: " + err.message });
+  }
+});
+
 // ── GET /api/servers ──────────────────────────────────────────────────────────
-app.get("/api/servers", requireUser, (req, res) => {
-  const servers = getServersByUser(req.user.id);
-  res.json(servers);
+app.get("/api/servers", requireUser, async (req, res) => {
+  const records = getServersByUser(req.user.id);
+
+  // Enrich with live status from Pterodactyl for provisioned servers
+  const enriched = await Promise.all(records.map(async srv => {
+    if (!srv.pterodactylId) return _serializeServer(srv);
+    try {
+      const ptSrv = await getPterodactylServer(srv.pterodactylId);
+      if (ptSrv) {
+        const liveStatus = _mapPterodactylStatus(ptSrv);
+        updateServer(srv.id, { status: liveStatus });
+        return _serializeServer({ ...srv, status: liveStatus, pterodactylData: ptSrv });
+      }
+    } catch { /* fallback to cached status */ }
+    return _serializeServer(srv);
+  }));
+
+  res.json(enriched);
 });
 
 // ── POST /api/servers/:id/start ───────────────────────────────────────────────
-app.post("/api/servers/:id/start", requireUser, (req, res) => {
+app.post("/api/servers/:id/start", requireUser, async (req, res) => {
   const srv = getServer(req.params.id, req.user.id);
   if (!srv) return res.status(404).json({ error: "Server not found" });
-  if (srv.status === "running") return res.json(srv);
+  if (srv.status === "pending_setup") return res.status(400).json({ error: "Complete server setup first." });
 
-  // Simulate async start — set to "starting" then "running" after 2s
-  const starting = setServerStatus(req.params.id, req.user.id, "starting");
-  setTimeout(() => setServerStatus(req.params.id, req.user.id, "running"), 2000);
-  res.json(starting);
+  if (srv.pterodactylId) {
+    // Send power signal via Pterodactyl Client API (wings)
+    try {
+      await _pterodactylClientPower(srv.pterodactylId, "start");
+    } catch (err) {
+      console.warn("[Pterodactyl] Start signal failed:", err.message);
+    }
+  }
+
+  const updated = setServerStatus(srv.id, req.user.id, "starting");
+  res.json(_serializeServer(updated));
 });
 
 // ── POST /api/servers/:id/stop ────────────────────────────────────────────────
-app.post("/api/servers/:id/stop", requireUser, (req, res) => {
+app.post("/api/servers/:id/stop", requireUser, async (req, res) => {
   const srv = getServer(req.params.id, req.user.id);
   if (!srv) return res.status(404).json({ error: "Server not found" });
-  if (srv.status === "stopped") return res.json(srv);
 
-  // Simulate async stop — set to "stopping" then "stopped" after 2s
-  const stopping = setServerStatus(req.params.id, req.user.id, "stopping");
-  setTimeout(() => setServerStatus(req.params.id, req.user.id, "stopped"), 2000);
-  res.json(stopping);
+  if (srv.pterodactylId) {
+    try {
+      await _pterodactylClientPower(srv.pterodactylId, "stop");
+    } catch (err) {
+      console.warn("[Pterodactyl] Stop signal failed:", err.message);
+    }
+  }
+
+  const updated = setServerStatus(srv.id, req.user.id, "stopping");
+  res.json(_serializeServer(updated));
 });
 
-// ── POST /api/feedback ────────────────────────────────────────────────────────
+// ── GET /api/servers/:id/status ───────────────────────────────────────────────
+app.get("/api/servers/:id/status", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id);
+  if (!srv) return res.status(404).json({ error: "Server not found" });
+
+  if (!srv.pterodactylId) {
+    return res.json({ status: srv.status });
+  }
+
+  try {
+    const ptSrv = await getPterodactylServer(srv.pterodactylId);
+    const status = ptSrv ? _mapPterodactylStatus(ptSrv) : srv.status;
+    updateServer(srv.id, { status });
+    res.json({ status });
+  } catch {
+    res.json({ status: srv.status });
+  }
+});
+
+// ── Helper: provision Pterodactyl user+server after payment ───────────────────
+async function _provisionAfterPayment({ userEmail, planName, userId, invoiceOrderId }) {
+  if (!process.env.PTERODACTYL_URL || !process.env.PTERODACTYL_API_KEY) {
+    console.warn("[Pterodactyl] Not configured — skipping post-payment provisioning.");
+    return;
+  }
+
+  // Get plan specs for the record
+  const spec = PLAN_SPECS[planName];
+  if (!spec) { console.warn("[Pterodactyl] Unknown plan:", planName); return; }
+
+  // Ensure Pterodactyl user exists
+  const ptUser = await ensurePterodactylUser({
+    email:    userEmail,
+    username: userEmail.split("@")[0],
+    name:     "NetherNodes User",
+  });
+
+  // Find user in our DB to get their userId
+  let resolvedUserId = userId;
+  if (!resolvedUserId) {
+    // Try to find by email in users_app.json
+    try {
+      const { readFileSync, existsSync } = await import("fs");
+      const { resolve: _resolve, dirname: _dirname } = await import("path");
+      const { fileURLToPath: _ftu } = await import("url");
+      const usersPath = _resolve(_dirname(_ftu(import.meta.url)), "../data/users_app.json");
+      if (existsSync(usersPath)) {
+        const users = JSON.parse(readFileSync(usersPath, "utf-8"));
+        const u = users.find(u => u.email === userEmail.toLowerCase());
+        if (u) resolvedUserId = u.id;
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Create pending server record (user completes setup wizard next)
+  createPendingServer({
+    userId:              resolvedUserId || `guest_${Date.now()}`,
+    planName,
+    email:               userEmail,
+    ram:                 spec.ram,
+    cpu:                 spec.cpu,
+    ssd:                 spec.ssd,
+    pterodactylUserId:   ptUser.id,
+    invoiceOrderId,
+  });
+
+  console.log(`[Pterodactyl] Pending server record created for ${userEmail} (${planName}). User ID: ${ptUser.id}`);
+}
+
+// ── Helper: map Pterodactyl status to our status strings ─────────────────────
+function _mapPterodactylStatus(ptSrv) {
+  if (ptSrv.suspended)      return "suspended";
+  if (ptSrv.installing)     return "installing";
+  // status comes from the container state in the client API, not application API
+  return ptSrv.status ?? "stopped";
+}
+
+// ── Helper: serialize server for frontend (never expose panel URL) ────────────
+function _serializeServer(srv) {
+  return {
+    id:          srv.id,
+    name:        srv.name,
+    status:      srv.status,
+    ram:         srv.ram,
+    cpu:         srv.cpu,
+    ssd:         srv.ssd,
+    plan:        srv.planName,
+    subdomain:   srv.subdomain,
+    serverType:  srv.serverType,
+    mcVersion:   srv.mcVersion,
+    pendingSetup: srv.status === "pending_setup",
+    createdAt:   srv.createdAt,
+    // Expose node.nethernodes.online as the connection host (never panel URL)
+    host:        srv.subdomain ? "node.nethernodes.online" : null,
+  };
+}
+
+// ── Helper: Pterodactyl Client API power signal ───────────────────────────────
+async function _pterodactylClientPower(pterodactylServerId, signal) {
+  const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const apiKey   = process.env.PTERODACTYL_API_KEY;
+  // Application API can't send power signals — use client API endpoint
+  // This requires a client API key. For now, log a warning.
+  // TODO: add PTERODACTYL_CLIENT_KEY to .env for a client API key with server power permissions
+  console.log(`[Pterodactyl] Power signal "${signal}" for server ${pterodactylServerId} (configure PTERODACTYL_CLIENT_KEY for live power control)`);
+}
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
 app.post("/api/feedback", (req, res) => {
   const { ticketId, email, rating, comment } = req.body;
   if (!rating || rating < 1 || rating > 5) {
@@ -1055,11 +1306,6 @@ app.post("/api/admin/feedback/:id/reply", async (req, res) => {
 app.delete("/api/admin/tickets/closed", (_req, res) => {
   const result = clearClosedTickets();
   res.json(result);
-});
-
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {

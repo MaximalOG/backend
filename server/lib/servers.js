@@ -1,6 +1,7 @@
 /**
  * Server management — file-backed store.
- * In production, replace with Pterodactyl API or your panel integration.
+ * Each record links the customer's userId to their Pterodactyl server + user IDs.
+ * Pterodactyl handles actual server ops; this file tracks the mapping.
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -29,32 +30,64 @@ export function getServersByUser(userId) {
 
 /** Get a single server by ID, verifying ownership. */
 export function getServer(id, userId) {
-  const servers = load();
-  return servers.find(s => s.id === id && s.userId === userId) || null;
+  return load().find(s => s.id === id && s.userId === userId) || null;
 }
 
-/** Create a server record after successful payment. */
-export function createServer({ userId, planName, email, ram, cpu, ssd }) {
+/** Get a server record by Pterodactyl server ID (panel-side ID). */
+export function getServerByPterodactylId(pterodactylId) {
+  return load().find(s => s.pterodactylId === pterodactylId) || null;
+}
+
+/**
+ * Create a pending server record after payment.
+ * The server is "pending_setup" until the user completes the setup wizard.
+ */
+export function createPendingServer({ userId, planName, email, ram, cpu, ssd, pterodactylUserId, invoiceOrderId }) {
   const servers = load();
-  const subdomain = `${email.split("@")[0].replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 16)}-${Date.now().toString(36)}`;
   const server = {
-    id: `srv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    id:                 `srv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     userId,
-    name: `${planName} Server`,
-    plan: planName,
-    status: "stopped",
+    planName,
+    name:               `${planName} Server`,
+    status:             "pending_setup",   // awaiting user to complete setup wizard
     ram,
     cpu,
     ssd,
-    subdomain: `${subdomain}.nethernodes.in`,
-    createdAt: new Date().toISOString(),
+    subdomain:          null,              // set after Pterodactyl provisioning
+    pterodactylId:      null,              // set after Pterodactyl provisioning
+    pterodactylUserId:  pterodactylUserId ?? null,
+    invoiceOrderId:     invoiceOrderId ?? null,
+    email,
+    serverType:         null,
+    mcVersion:          null,
+    createdAt:          new Date().toISOString(),
+    provisionedAt:      null,
   };
   servers.push(server);
   save(servers);
   return server;
 }
 
-/** Update server status. */
+/**
+ * Mark a server as provisioned after Pterodactyl creates it.
+ * Stores the Pterodactyl server ID, subdomain, type, version.
+ */
+export function markServerProvisioned(id, { pterodactylId, subdomain, serverType, mcVersion, name }) {
+  const servers = load();
+  const srv = servers.find(s => s.id === id);
+  if (!srv) return null;
+  srv.pterodactylId  = pterodactylId;
+  srv.subdomain      = subdomain;
+  srv.status         = "installing";   // Pterodactyl is installing the server
+  srv.serverType     = serverType ?? srv.serverType;
+  srv.mcVersion      = mcVersion  ?? srv.mcVersion;
+  if (name) srv.name = name;
+  srv.provisionedAt  = new Date().toISOString();
+  save(servers);
+  return srv;
+}
+
+/** Update server status. Used for start/stop polling. */
 export function setServerStatus(id, userId, status) {
   const servers = load();
   const srv = servers.find(s => s.id === id && s.userId === userId);
@@ -62,4 +95,24 @@ export function setServerStatus(id, userId, status) {
   srv.status = status;
   save(servers);
   return srv;
+}
+
+/** Update any fields on a server record. */
+export function updateServer(id, fields) {
+  const servers = load();
+  const srv = servers.find(s => s.id === id);
+  if (!srv) return null;
+  Object.assign(srv, fields);
+  save(servers);
+  return srv;
+}
+
+/** Delete a server record. */
+export function deleteServerRecord(id) {
+  const servers = load();
+  const idx = servers.findIndex(s => s.id === id);
+  if (idx === -1) return false;
+  servers.splice(idx, 1);
+  save(servers);
+  return true;
 }
