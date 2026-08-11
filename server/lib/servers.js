@@ -68,16 +68,27 @@ export function createPendingServer({ userId, planName, email, ram, cpu, ssd, pt
   return server;
 }
 
+/** Atomically move a pending server into provisioning, preventing duplicate creates. */
+export function beginServerProvisioning(id, userId) {
+  const servers = load();
+  const srv = servers.find(s => s.id === id && s.userId === userId);
+  if (!srv || srv.status !== "pending_setup") return null;
+  srv.status = "provisioning";
+  save(servers);
+  return srv;
+}
+
 /**
  * Mark a server as provisioned after Pterodactyl creates it.
  * Stores the Pterodactyl server ID, subdomain, type, version.
  */
-export function markServerProvisioned(id, { pterodactylId, subdomain, serverType, mcVersion, name }) {
+export function markServerProvisioned(id, { pterodactylId, connectionAddress, serverType, mcVersion, name }) {
   const servers = load();
   const srv = servers.find(s => s.id === id);
   if (!srv) return null;
   srv.pterodactylId  = pterodactylId;
-  srv.subdomain      = subdomain;
+  srv.connectionAddress = connectionAddress ?? null;
+  srv.subdomain      = null;
   srv.status         = "installing";   // Pterodactyl is installing the server
   srv.serverType     = serverType ?? srv.serverType;
   srv.mcVersion      = mcVersion  ?? srv.mcVersion;

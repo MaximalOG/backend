@@ -41,16 +41,29 @@ export const SERVER_TYPES = [
 // ── Low-level fetch helper ────────────────────────────────────────────────────
 async function panelFetch(path, options = {}) {
   const url = `${PANEL_URL}/api/application${path}`;
-  const res  = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${API_KEY}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      ...options.headers,
-    },
-  });
+  if (!PANEL_URL || !API_KEY) throw new Error("Pterodactyl is not configured.");
 
+  // Never let an unavailable panel hold a customer request indefinitely.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  const abortParent = () => controller.abort();
+  options.signal?.addEventListener?.("abort", abortParent, { once: true });
+  let res;
+  try {
+    res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...options.headers,
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener?.("abort", abortParent);
+  }
   if (!res.ok) {
     let body = "";
     try { body = JSON.stringify(await res.json()); } catch { /* ignore */ }
@@ -218,10 +231,10 @@ async function getNextFreeAllocation() {
   return free.attributes.id;
 }
 
-/** Get a server by its Pterodactyl server ID. */
-export async function getPterodactylServer(pterodactylServerId) {
+/** Get a server by its Pterodactyl server ID. Accepts an optional AbortSignal for timeout control. */
+export async function getPterodactylServer(pterodactylServerId, signal) {
   try {
-    const data = await panelFetch(`/servers/${pterodactylServerId}`);
+    const data = await panelFetch(`/servers/${pterodactylServerId}`, signal ? { signal } : {});
     return data?.attributes ?? null;
   } catch {
     return null;
@@ -258,7 +271,12 @@ function generatePassword(len = 24) {
   return pw;
 }
 
-/** Returns the server types list for the frontend setup UI. */
+/** Returns public server type options for the setup UI. Internal fields (eggId etc.) are not included. */
 export function getServerTypes() {
-  return SERVER_TYPES;
+  return SERVER_TYPES.map(({ id, label, description }) => ({ id, label, description }));
+}
+
+/** Resolve a public type ID to its private provisioning configuration. */
+export function getServerTypeConfig(typeId) {
+  return SERVER_TYPES.find(type => type.id === typeId) ?? null;
 }
