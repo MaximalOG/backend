@@ -1007,6 +1007,33 @@ app.get("/api/server-types", (_req, res) => {
   res.json(getServerTypes());
 });
 
+// ── GET /api/servers/pending ──────────────────────────────────────────────────
+// Find pending-setup servers by invoice orderId or by the logged-in user
+app.get("/api/servers/pending", requireUser, async (req, res) => {
+  const { orderId } = req.query;
+  const { readFileSync: rfs, existsSync: efs } = await import("fs");
+  const { resolve: _res2, dirname: _dn2 } = await import("path");
+  const { fileURLToPath: _ftu2 } = await import("url");
+  const srvPath = _res2(_dn2(_ftu2(import.meta.url)), "../data/servers.json");
+  if (!efs(srvPath)) return res.json([]);
+  try {
+    const allSrvs = JSON.parse(rfs(srvPath, "utf-8"));
+    const pending = allSrvs.filter(s => s.status === "pending_setup");
+    if (orderId) {
+      const byOrder = pending.find(s => s.invoiceOrderId === orderId);
+      if (byOrder) {
+        // Claim this server for the logged-in user
+        updateServer(byOrder.id, { userId: req.user.id, email: req.user.email });
+        return res.json([_serializeServer({ ...byOrder, userId: req.user.id })]);
+      }
+    }
+    // Fall back to userId match
+    return res.json(pending.filter(s => s.userId === req.user.id).map(_serializeServer));
+  } catch {
+    return res.json([]);
+  }
+});
+
 // ── POST /api/servers/:id/setup ───────────────────────────────────────────────
 // Called from the setup wizard — provisions the actual Pterodactyl server
 app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
@@ -1015,7 +1042,28 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
   if (!serverName?.trim()) return res.status(400).json({ error: "Server name is required." });
   if (!serverType)         return res.status(400).json({ error: "Server type is required." });
 
-  const srv = getServer(req.params.id, req.user.id);
+  // Look up by ID — at this point, fix the userId to the logged-in user
+  const all = (await import("./lib/servers.js")).then ? null : null;
+  const { readFileSync: rfs, existsSync: efs } = await import("fs");
+  const { resolve: _res, dirname: _dn } = await import("path");
+  const { fileURLToPath: _ftu } = await import("url");
+  const srvPath = _res(_dn(_ftu(import.meta.url)), "../data/servers.json");
+
+  let srv = getServer(req.params.id, req.user.id);
+
+  // If not found by userId, try by record id + fix userId (happens when paid without login)
+  if (!srv && efs(srvPath)) {
+    try {
+      const allSrvs = JSON.parse(rfs(srvPath, "utf-8"));
+      const found = allSrvs.find(s => s.id === req.params.id && s.status === "pending_setup");
+      if (found) {
+        // Reassign this server to the logged-in user
+        updateServer(found.id, { userId: req.user.id, email: req.user.email });
+        srv = { ...found, userId: req.user.id };
+      }
+    } catch { /* ignore */ }
+  }
+
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (srv.status !== "pending_setup") {
     return res.status(400).json({ error: "Server is already set up or being provisioned." });
