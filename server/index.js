@@ -273,9 +273,26 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
+    // Plan list — intercept before AI so formatting is always perfect
+    const PLAN_LIST_TRIGGERS = [
+      "all plans", "show plans", "list plans", "what plans", "all the plans",
+      "show me plans", "list all", "what are the plans", "what are your plans",
+      "available plans", "pricing plans", "all pricing", "show pricing",
+    ];
+    if (PLAN_LIST_TRIGGERS.some(t => lower.includes(t))) {
+      const lines = ctx.AVAILABLE_PLANS.map(name => {
+        const price = ctx.PRICING[name];
+        const spec = ctx.PLAN_SPECS[name];
+        return `🟢 ${name} — ${spec.ram} RAM · ${price}`;
+      }).join("\n");
+      return res.json({
+        message: `🎮 Minecraft Server Plans\n\n${lines}\n\n💡 Need help choosing? Tell me how many players you expect and I'll pick the right one.`,
+        showButtons: false, recommendedPlan: null, ramRequired: null, flowState: null,
+      });
+    }
+
     // Escalation — intercept before AI, use varied backend responses
-    if (shouldEscalate(message)) {
-      const offer = pickEscalationOffer(message, history);
+    if (shouldEscalate(message)) {      const offer = pickEscalationOffer(message, history);
       return res.json({
         message:         offer,
         showButtons:     false,
