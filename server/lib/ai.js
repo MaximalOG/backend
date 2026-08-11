@@ -1,5 +1,6 @@
 import { generateWithOpenAI } from "./providers/openai.js";
 import { generateWithOllama } from "./providers/ollama.js";
+import { generateWithNvidia } from "./providers/nvidia.js";
 import { calculatePlan } from "./calculator.js";
 import { buildAIContext } from "./config.js";
 
@@ -7,9 +8,14 @@ export async function generateAIResponse(message, history = [], ctx = null, atta
   const context = ctx ?? buildAIContext();
   const provider = process.env.AI_PROVIDER || "openai";
 
-  const generate = provider === "ollama"
-    ? (msg, hist, sysCtx) => generateWithOllama(msg, hist, sysCtx)
-    : (msg, hist, sysCtx, att) => generateWithOpenAI(msg, hist, sysCtx, att);
+  let generate;
+  if (provider === "ollama") {
+    generate = (msg, hist, sysCtx) => generateWithOllama(msg, hist, sysCtx);
+  } else if (provider === "nvidia") {
+    generate = (msg, hist, sysCtx, att) => generateWithNvidia(msg, hist, sysCtx, att);
+  } else {
+    generate = (msg, hist, sysCtx, att) => generateWithOpenAI(msg, hist, sysCtx, att);
+  }
 
   // First pass
   let raw = await generate(message, history, context, attachment);
