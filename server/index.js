@@ -1036,10 +1036,10 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
   return res.json({ ok: true, planName: planKey, invoiceOrderId: issuedInvoice.orderId, serverId: pendingServer.id });
 
   // Generate a fake invoice ID for tracking
-  const { createAndSendInvoice } = await import("./lib/invoice.js");
+  const { createAndSendInvoice: legacyCreateAndSendInvoice } = await import("./lib/invoice.js");
   let invoiceOrderId = null;
   try {
-    const invoice = await createAndSendInvoice({
+    const invoice = await legacyCreateAndSendInvoice({
       userEmail, planName: planKey,
       planRam: spec.ram,
       originalPrice: 0, discountAmount: 0, finalPrice: 0,
