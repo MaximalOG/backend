@@ -62,11 +62,21 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
     { role: "user", content: userContent },
   ];
 
-  const response = await getClient().chat.completions.create({
-    model,
-    messages,
-    max_tokens: 500,
-  });
+  let response;
+  try {
+    response = await getClient().chat.completions.create({
+      model,
+      messages,
+      temperature: 0.6,
+      top_p: 0.7,
+      max_tokens: 1024,
+      stream: false,
+    });
+  } catch (err) {
+    // Log the full error so it shows up in PM2 logs
+    console.error("[NVIDIA Provider Error]", err?.status, err?.message, JSON.stringify(err?.error ?? {}));
+    throw err;
+  }
 
   return response.choices[0].message.content.trim();
 }

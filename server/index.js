@@ -141,6 +141,9 @@ app.use(cors({
 // Security headers
 app.use(helmet({ contentSecurityPolicy: false }));
 
+// Trust Cloudflare proxy — required for express-rate-limit behind Cloudflare
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "2mb" }));
 
 // Rate limiter for auth routes — 10 attempts per minute per IP
@@ -311,7 +314,20 @@ app.post("/api/chat", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("[NetherNodes AI Error]", err?.message || err);
+    const msg = err?.message || String(err);
+    const status = err?.status || err?.response?.status || 500;
+    console.error("[NetherNodes AI Error]", status, msg);
+
+    // Surface specific provider errors to help with debugging
+    if (status === 401 || msg.includes("401") || msg.includes("Unauthorized") || msg.includes("API key")) {
+      return res.status(500).json({ error: "AI provider authentication failed. Please check the API key." });
+    }
+    if (status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("quota")) {
+      return res.status(500).json({ error: "AI provider rate limit reached. Please try again in a moment." });
+    }
+    if (status === 503 || msg.includes("503") || msg.includes("unavailable") || msg.includes("overloaded")) {
+      return res.status(500).json({ error: "AI provider is temporarily unavailable. Please try again shortly." });
+    }
     return res.status(500).json({ error: "Server is busy, please try again." });
   }
 });
