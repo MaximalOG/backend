@@ -309,3 +309,60 @@ export function getServerTypes() {
 export function getServerTypeConfig(typeId) {
   return SERVER_TYPES.find(type => type.id === typeId) ?? null;
 }
+
+/**
+ * Get a short-lived WebSocket token for a server's console.
+ * Uses the Client API key — never exposed to the browser.
+ * Returns { token, socket } where socket is the wss:// URL.
+ */
+export async function getConsoleCredentials(pterodactylServerId) {
+  const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY || "";
+  if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
+
+  const url = `${panelUrl}/api/client/servers/${pterodactylServerId}/websocket`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${clientKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()); } catch {}
+    throw new Error(`Pterodactyl Client API error ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  return {
+    token:  data.data?.token  ?? null,
+    socket: data.data?.socket ?? null,
+  };
+}
+
+/**
+ * Send a power signal to a server via the Client API.
+ * signal: "start" | "stop" | "restart" | "kill"
+ */
+export async function sendPowerSignal(pterodactylServerId, signal) {
+  const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY || "";
+  if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
+
+  const url = `${panelUrl}/api/client/servers/${pterodactylServerId}/power`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${clientKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ signal }),
+  });
+  if (!res.ok && res.status !== 204) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()); } catch {}
+    throw new Error(`Power signal error ${res.status}: ${body}`);
+  }
+  return true;
+}

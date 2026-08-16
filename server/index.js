@@ -38,7 +38,7 @@ import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verif
 import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
-import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer } from "./lib/pterodactyl.js";
+import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal } from "./lib/pterodactyl.js";
 import { savePaymentOrder, getPaymentOrder, markPaymentOrderPaid } from "./lib/orders.js";
 import crypto from "crypto";
 
@@ -1032,7 +1032,18 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
 
   const spec = PLAN_SPECS[planKey];
   if (spec.priceInr !== 0) return res.status(400).json({ error: "Only free plans can use this endpoint." });
-  if (getServersByUser(req.user.id, req.user.email).some(server => server.planName === planKey)) {
+
+  const existing = getServersByUser(req.user.id, req.user.email).filter(s => s.planName === planKey);
+
+  // If there's already a pending_setup server for this plan, just redirect to it
+  const pendingExisting = existing.find(s => s.status === "pending_setup");
+  if (pendingExisting) {
+    return res.json({ ok: true, planName: planKey, invoiceOrderId: pendingExisting.invoiceOrderId, serverId: pendingExisting.id });
+  }
+
+  // If a provisioned/active server already exists, block
+  const activeExisting = existing.find(s => s.status !== "pending_setup");
+  if (activeExisting) {
     return res.status(409).json({ error: "Your account has already claimed this free plan." });
   }
 
@@ -1359,6 +1370,43 @@ async function _pterodactylClientPower(pterodactylServerId, signal) {
   // TODO: add PTERODACTYL_CLIENT_KEY to .env for a client API key with server power permissions
   console.log(`[Pterodactyl] Power signal "${signal}" for server ${pterodactylServerId} (configure PTERODACTYL_CLIENT_KEY for live power control)`);
 }
+
+// ── GET /api/servers/:id/console-token ───────────────────────────────────────
+// Returns a short-lived Pterodactyl WebSocket token — never exposes the client key.
+app.get("/api/servers/:id/console-token", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  try {
+    const creds = await getConsoleCredentials(srv.pterodactylId);
+    res.json(creds);
+  } catch (err) {
+    console.error("[Console] Token fetch failed:", err.message);
+    res.status(502).json({ error: "Could not connect to game panel. Please try again." });
+  }
+});
+
+// ── POST /api/servers/:id/power ───────────────────────────────────────────────
+// signal: start | stop | restart | kill
+app.post("/api/servers/:id/power", requireUser, async (req, res) => {
+  const { signal } = req.body;
+  if (!["start", "stop", "restart", "kill"].includes(signal)) {
+    return res.status(400).json({ error: "signal must be start, stop, restart, or kill" });
+  }
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  try {
+    await sendPowerSignal(srv.pterodactylId, signal);
+    console.log(`[Power] ${signal} → server ${srv.id} (ptero ${srv.pterodactylId}) by ${req.user.email}`);
+    res.json({ ok: true, signal });
+  } catch (err) {
+    console.error("[Power] Signal failed:", err.message);
+    res.status(502).json({ error: "Could not send power signal. Please try again." });
+  }
+});
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
