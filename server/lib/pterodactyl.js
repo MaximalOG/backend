@@ -12,8 +12,6 @@
  *   5 = Paper
  */
 
-const PANEL_URL = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
-const API_KEY   = process.env.PTERODACTYL_API_KEY || "";
 const NODE_ID   = 1;
 const LOCATION_ID = 1;
 const NEST_ID   = 1;
@@ -40,8 +38,14 @@ export const SERVER_TYPES = [
 
 // ── Low-level fetch helper ────────────────────────────────────────────────────
 async function panelFetch(path, options = {}, timeoutMs = 30000) {
-  const url = `${PANEL_URL}/api/application${path}`;
-  if (!PANEL_URL || !API_KEY) throw new Error("Pterodactyl is not configured.");
+  // Read env vars lazily — index.js loads .env before calling us, but ES module
+  // top-level code runs before the .env loader in index.js has a chance to set
+  // process.env. Reading here (inside a function) guarantees the values are set.
+  const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
+  const apiKey   = process.env.PTERODACTYL_API_KEY || "";
+
+  const url = `${panelUrl}/api/application${path}`;
+  if (!panelUrl || !apiKey) throw new Error("Pterodactyl is not configured.");
 
   // Use a generous timeout for provisioning calls — server creation can be slow.
   const controller = new AbortController();
@@ -54,7 +58,7 @@ async function panelFetch(path, options = {}, timeoutMs = 30000) {
       ...options,
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         Accept: "application/json",
         ...options.headers,
