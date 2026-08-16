@@ -208,6 +208,9 @@ export async function provisionServer({ pterodactylUserId, serverName, planName,
   if ("SERVER_JARFILE" in environment && !environment.SERVER_JARFILE) {
     environment.SERVER_JARFILE = "server.jar";
   }
+  // Auto-accept EULA — users agree to Minecraft's EULA by purchasing/using the service
+  if ("EULA" in environment) environment.EULA = "TRUE";
+  environment.EULA = "TRUE"; // set regardless, Wings will use it if the egg supports it
 
   const body = {
     name:         serverName.slice(0, 48),

@@ -1362,6 +1362,80 @@ function _serializeServer(srv) {
   };
 }
 
+// ── Helper: look up a NetherNodes app user by email ──────────────────────────
+function loadAppUserByEmail(email) {
+  try {
+    const usersPath = resolve(__dirname, "../data/users_app.json");
+    if (!existsSync(usersPath)) return null;
+    const users = JSON.parse(readFileSync(usersPath, "utf-8"));
+    return users.find(u => u.email === email.trim().toLowerCase()) ?? null;
+  } catch { return null; }
+}
+
+// ── Helper: Pterodactyl Client API fetch ─────────────────────────────────────
+async function clientFetch(identifier, path, options = {}) {
+  const panelUrl   = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey  = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
+
+  const url = `${panelUrl}/api/client/servers/${identifier}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${clientKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+  if (!res.ok && res.status !== 204) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()); } catch {}
+    throw new Error(`Pterodactyl Client API error ${res.status} on ${path}: ${body}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+async function clientFetchRaw(identifier, path) {
+  const panelUrl   = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey  = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
+
+  const url = `${panelUrl}/api/client/servers/${identifier}${path}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${clientKey}`, Accept: "text/plain" },
+  });
+  if (!res.ok) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()); } catch {}
+    throw new Error(`Pterodactyl Client API error ${res.status} on ${path}: ${body}`);
+  }
+  return res.text();
+}
+
+async function clientFetchWrite(identifier, path, content) {
+  const panelUrl   = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey  = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
+
+  const url = `${panelUrl}/api/client/servers/${identifier}${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${clientKey}`,
+      "Content-Type": "text/plain",
+    },
+    body: content,
+  });
+  if (!res.ok && res.status !== 204) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()); } catch {}
+    throw new Error(`Pterodactyl write error ${res.status} on ${path}: ${body}`);
+  }
+  return true;
+}
+
 // ── Helper: Pterodactyl Client API power signal ───────────────────────────────
 async function _pterodactylClientPower(pterodactylServerId, signal) {
   const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -1372,7 +1446,203 @@ async function _pterodactylClientPower(pterodactylServerId, signal) {
   console.log(`[Pterodactyl] Power signal "${signal}" for server ${pterodactylServerId} (configure PTERODACTYL_CLIENT_KEY for live power control)`);
 }
 
-// ── GET /api/servers/:id/console-token ───────────────────────────────────────
+// ── GET /api/servers/:id/users ────────────────────────────────────────────────
+app.get("/api/servers/:id/users", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+  try {
+    const data = await clientFetch(identifier, "/users");
+    // Enrich each subuser with their NetherNodes account info
+    const subusers = (data?.data ?? []).map(u => {
+      const attr = u.attributes;
+      // Look up whether this email has a NetherNodes account
+      const nnUser = loadAppUserByEmail(attr.email);
+      return {
+        uuid:        attr.uuid,
+        username:    attr.username,
+        email:       attr.email,
+        permissions: attr.permissions ?? [],
+        twoFactor:   attr.two_factor_authentication,
+        nnAccount:   nnUser ? { name: nnUser.name, username: nnUser.username } : null,
+      };
+    });
+    res.json(subusers);
+  } catch (err) {
+    console.error("[Users] List failed:", err.message);
+    res.status(502).json({ error: "Could not list server users." });
+  }
+});
+
+// ── POST /api/servers/:id/users ───────────────────────────────────────────────
+// Add a subuser — they must have a NetherNodes account
+app.post("/api/servers/:id/users", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const { email, permissions } = req.body;
+  if (!email) return res.status(400).json({ error: "email is required." });
+  if (email.toLowerCase() === req.user.email.toLowerCase()) {
+    return res.status(400).json({ error: "You are already the server owner." });
+  }
+
+  // Require the invited user to have a NetherNodes account
+  const nnUser = loadAppUserByEmail(email);
+  if (!nnUser) {
+    return res.status(404).json({ error: "No NetherNodes account found with that email. The user must sign up first." });
+  }
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+  const defaultPerms = permissions ?? [
+    "control.console", "control.start", "control.stop", "control.restart",
+    "file.read", "file.read-content", "file.create", "file.update",
+  ];
+
+  try {
+    const data = await clientFetch(identifier, "/users", {
+      method: "POST",
+      body: JSON.stringify({ email: email.toLowerCase(), permissions: defaultPerms }),
+    });
+    const attr = data?.attributes ?? {};
+    console.log(`[Users] Added ${email} to server ${srv.id} by ${req.user.email}`);
+    res.json({
+      uuid:        attr.uuid,
+      username:    attr.username,
+      email:       attr.email,
+      permissions: attr.permissions ?? defaultPerms,
+      nnAccount:   { name: nnUser.name, username: nnUser.username },
+    });
+  } catch (err) {
+    console.error("[Users] Add failed:", err.message);
+    if (err.message.includes("already")) {
+      return res.status(409).json({ error: "This user already has access to the server." });
+    }
+    res.status(502).json({ error: "Could not add user. " + err.message });
+  }
+});
+
+// ── PATCH /api/servers/:id/users/:uuid ────────────────────────────────────────
+app.patch("/api/servers/:id/users/:uuid", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const { permissions } = req.body;
+  if (!Array.isArray(permissions)) return res.status(400).json({ error: "permissions array is required." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+  try {
+    const data = await clientFetch(identifier, `/users/${req.params.uuid}`, {
+      method: "POST",
+      body: JSON.stringify({ permissions }),
+    });
+    res.json({ ok: true, permissions: data?.attributes?.permissions ?? permissions });
+  } catch (err) {
+    console.error("[Users] Update failed:", err.message);
+    res.status(502).json({ error: "Could not update permissions." });
+  }
+});
+
+// ── DELETE /api/servers/:id/users/:uuid ───────────────────────────────────────
+app.delete("/api/servers/:id/users/:uuid", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+  try {
+    await clientFetch(identifier, `/users/${req.params.uuid}`, { method: "DELETE" });
+    console.log(`[Users] Removed subuser ${req.params.uuid} from server ${srv.id} by ${req.user.email}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[Users] Remove failed:", err.message);
+    res.status(502).json({ error: "Could not remove user." });
+  }
+});
+app.get("/api/servers/:id/files", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+  const dir = req.query.directory || "/";
+
+  try {
+    const data = await clientFetch(identifier, `/files/list?directory=${encodeURIComponent(dir)}`);
+    res.json(data?.data ?? []);
+  } catch (err) {
+    console.error("[Files] List failed:", err.message);
+    res.status(502).json({ error: "Could not list files." });
+  }
+});
+
+// ── GET /api/servers/:id/files/contents ───────────────────────────────────────
+app.get("/api/servers/:id/files/contents", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const { file } = req.query;
+  if (!file) return res.status(400).json({ error: "file path is required." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+
+  try {
+    const text = await clientFetchRaw(identifier, `/files/contents?file=${encodeURIComponent(file)}`);
+    res.json({ content: text });
+  } catch (err) {
+    console.error("[Files] Read failed:", err.message);
+    res.status(502).json({ error: "Could not read file." });
+  }
+});
+
+// ── POST /api/servers/:id/files/write ─────────────────────────────────────────
+app.post("/api/servers/:id/files/write", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const { file } = req.query;
+  const { content } = req.body;
+  if (!file) return res.status(400).json({ error: "file path is required." });
+  if (content === undefined) return res.status(400).json({ error: "content is required." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+
+  try {
+    await clientFetchWrite(identifier, `/files/write?file=${encodeURIComponent(file)}`, content);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[Files] Write failed:", err.message);
+    res.status(502).json({ error: "Could not write file." });
+  }
+});
+
+// ── DELETE /api/servers/:id/files ─────────────────────────────────────────────
+app.delete("/api/servers/:id/files", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const { files } = req.body; // array of { name, isFile } objects
+  if (!Array.isArray(files) || files.length === 0) return res.status(400).json({ error: "files array is required." });
+
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+
+  try {
+    await clientFetch(identifier, "/files/delete", {
+      method: "POST",
+      body: JSON.stringify({ root: "/", files }),
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[Files] Delete failed:", err.message);
+    res.status(502).json({ error: "Could not delete files." });
+  }
+});
 // Returns a short-lived Pterodactyl WebSocket token — never exposes the client key.
 app.get("/api/servers/:id/console-token", requireUser, async (req, res) => {
   const srv = getServer(req.params.id, req.user.id, req.user.email);
