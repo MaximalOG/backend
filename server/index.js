@@ -151,6 +151,11 @@ app.use(cors({
 // Security headers
 app.use(helmet({ contentSecurityPolicy: false }));
 
+// Disable ETags — API responses are dynamic (user-specific, auth-gated).
+// ETags cause browsers to send If-None-Match and get 304 No Content back,
+// which breaks JSON parsing on the frontend.
+app.set("etag", false);
+
 // Trust Cloudflare proxy — required for express-rate-limit behind Cloudflare
 app.set("trust proxy", 1);
 
