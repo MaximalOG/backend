@@ -1129,7 +1129,8 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
     });
 
     // Build the subdomain/connection string
-    const allocation = ptServer.allocation || {};
+    // _resolvedAllocation is set by provisionServer from the relationships data
+    const allocation = ptServer._resolvedAllocation || {};
     const connectionAddress = allocation.ip
       ? `${allocation.ip}${allocation.port ? `:${allocation.port}` : ""}`
       : null;

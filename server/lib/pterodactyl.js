@@ -39,13 +39,13 @@ export const SERVER_TYPES = [
 ];
 
 // ── Low-level fetch helper ────────────────────────────────────────────────────
-async function panelFetch(path, options = {}) {
+async function panelFetch(path, options = {}, timeoutMs = 30000) {
   const url = `${PANEL_URL}/api/application${path}`;
   if (!PANEL_URL || !API_KEY) throw new Error("Pterodactyl is not configured.");
 
-  // Never let an unavailable panel hold a customer request indefinitely.
+  // Use a generous timeout for provisioning calls — server creation can be slow.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const abortParent = () => controller.abort();
   options.signal?.addEventListener?.("abort", abortParent, { once: true });
   let res;
@@ -215,12 +215,22 @@ export async function provisionServer({ pterodactylUserId, serverName, planName,
     },
   };
 
-  const data = await panelFetch("/servers", {
+  const data = await panelFetch("/servers?include=allocations", {
     method: "POST",
     body: JSON.stringify(body),
   });
 
-  return data.attributes;
+  const attrs = data.attributes;
+
+  // The Application API returns the default allocation nested under
+  // relationships.allocations.data[0].attributes — not as a top-level key.
+  const allocAttrs = attrs.relationships?.allocations?.data?.[0]?.attributes ?? {};
+  attrs._resolvedAllocation = {
+    ip:   allocAttrs.ip   ?? allocAttrs.alias ?? null,
+    port: allocAttrs.port ?? null,
+  };
+
+  return attrs;
 }
 
 /** Get the first unassigned allocation on NODE_ID. */
@@ -234,7 +244,8 @@ async function getNextFreeAllocation() {
 /** Get a server by its Pterodactyl server ID. Accepts an optional AbortSignal for timeout control. */
 export async function getPterodactylServer(pterodactylServerId, signal) {
   try {
-    const data = await panelFetch(`/servers/${pterodactylServerId}`, signal ? { signal } : {});
+    // Status polls should be fast — 5s is fine here
+    const data = await panelFetch(`/servers/${pterodactylServerId}`, signal ? { signal } : {}, 5000);
     return data?.attributes ?? null;
   } catch {
     return null;
