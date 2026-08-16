@@ -134,9 +134,12 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Netlify production/preview deployments need to preflight Authorization headers.
-    const isNetlifyDeployment = /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin || "");
-    if (!origin || allowedOrigins.includes(origin) || isNetlifyDeployment) return callback(null, true);
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    // Allow configured origins
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Allow Netlify preview deployments
+    if (/^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin)) return callback(null, true);
     callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
