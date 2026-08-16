@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -532,8 +532,10 @@ app.get("/api/location", (req, res) => {
   res.json({ country });
 });
 
-// ── GET /api/plans ────────────────────────────────────────────────────────────
-const PLAN_SPECS = {
+// ── Plan pricing — file-backed so owner can update without redeploying ────────
+const PLAN_PRICES_PATH = resolve(__dirname, "../data/plan_prices.json");
+
+const PLAN_SPECS_DEFAULT = {
   Nano:    { ram: "1GB",  cpu: "50%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
   Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB",  priceInr: 0,    tier: "Entry" },
   Plus:    { ram: "3GB",  cpu: "150%", ssd: "15GB",  priceInr: 129,  tier: "Entry" },
@@ -545,8 +547,74 @@ const PLAN_SPECS = {
   Titan:   { ram: "16GB", cpu: "450%", ssd: "140GB", priceInr: 1099, tier: "Advanced" },
 };
 
+// Merge saved prices into the spec — only priceInr and popular are overrideable
+function loadPlanSpecs() {
+  try {
+    if (existsSync(PLAN_PRICES_PATH)) {
+      const saved = JSON.parse(readFileSync(PLAN_PRICES_PATH, "utf-8"));
+      const merged = { ...PLAN_SPECS_DEFAULT };
+      for (const [name, overrides] of Object.entries(saved)) {
+        if (merged[name]) merged[name] = { ...merged[name], ...overrides };
+      }
+      return merged;
+    }
+  } catch { /* fall through to defaults */ }
+  return { ...PLAN_SPECS_DEFAULT };
+}
+
+function savePlanPrices(updates) {
+  // Only persist priceInr and popular overrides — never hardware specs
+  const existing = (() => {
+    try { return existsSync(PLAN_PRICES_PATH) ? JSON.parse(readFileSync(PLAN_PRICES_PATH, "utf-8")) : {}; }
+    catch { return {}; }
+  })();
+  const merged = { ...existing };
+  for (const [name, fields] of Object.entries(updates)) {
+    merged[name] = merged[name] ?? {};
+    if ("priceInr" in fields) merged[name].priceInr = Number(fields.priceInr);
+    if ("popular"  in fields) merged[name].popular  = Boolean(fields.popular);
+  }
+  mkdirSync(dirname(PLAN_PRICES_PATH), { recursive: true });
+  writeFileSync(PLAN_PRICES_PATH, JSON.stringify(merged, null, 2), "utf-8");
+}
+
+// PLAN_SPECS is re-evaluated on every request to pick up live price changes
+const PLAN_SPECS = new Proxy({}, {
+  get(_, key) { return loadPlanSpecs()[key]; },
+  ownKeys()   { return Object.keys(PLAN_SPECS_DEFAULT); },
+  has(_, key) { return key in PLAN_SPECS_DEFAULT; },
+  getOwnPropertyDescriptor(_, key) {
+    return key in PLAN_SPECS_DEFAULT ? { enumerable: true, configurable: true } : undefined;
+  },
+});
+
+// ── GET /api/admin/plans ──────────────────────────────────────────────────────
+app.get("/api/admin/plans", requireAuth, requireOwner, (_req, res) => {
+  res.json(loadPlanSpecs());
+});
+
+// ── PATCH /api/admin/plans ────────────────────────────────────────────────────
+app.patch("/api/admin/plans", requireAuth, requireOwner, (req, res) => {
+  const updates = req.body;
+  if (!updates || typeof updates !== "object") {
+    return res.status(400).json({ error: "Body must be an object of plan name → { priceInr, popular? }" });
+  }
+  // Validate — only allow known plan names and numeric prices
+  for (const [name, fields] of Object.entries(updates)) {
+    if (!PLAN_SPECS_DEFAULT[name]) return res.status(400).json({ error: `Unknown plan: ${name}` });
+    if ("priceInr" in fields && (isNaN(Number(fields.priceInr)) || Number(fields.priceInr) < 0)) {
+      return res.status(400).json({ error: `Invalid price for ${name}` });
+    }
+  }
+  savePlanPrices(updates);
+  console.log("[Plans] Prices updated by owner:", JSON.stringify(updates));
+  res.json(loadPlanSpecs());
+});
+
+// ── GET /api/plans ────────────────────────────────────────────────────────────
 app.get("/api/plans", (_req, res) => {
-  const plans = Object.entries(PLAN_SPECS).map(([name, spec]) => ({ name, ...spec }));
+  const specs = loadPlanSpecs();
+  const plans = Object.entries(specs).map(([name, spec]) => ({ name, ...spec }));
   res.json(plans);
 });
 
@@ -1088,7 +1156,26 @@ app.get("/api/server-types", (_req, res) => {
   res.json(getServerTypes());
 });
 
-// ── GET /api/servers/pending ──────────────────────────────────────────────────
+// ── DELETE /api/servers/:id ───────────────────────────────────────────────────
+app.delete("/api/servers/:id", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+
+  // Delete from Pterodactyl if it was provisioned
+  if (srv.pterodactylId) {
+    try {
+      await deletePterodactylServer(srv.pterodactylId);
+      console.log(`[Server] Deleted Pterodactyl server ${srv.pterodactylId} for ${req.user.email}`);
+    } catch (err) {
+      console.error("[Server] Pterodactyl delete failed:", err.message);
+      // Continue — still remove our local record even if panel deletion fails
+    }
+  }
+
+  deleteServerRecord(srv.id);
+  console.log(`[Server] Deleted server record ${srv.id} for ${req.user.email}`);
+  res.json({ ok: true });
+});
 // Find pending-setup servers by invoice orderId or by the logged-in user
 app.get("/api/servers/pending", requireUser, (req, res) => {
   const { orderId } = req.query;
