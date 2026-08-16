@@ -169,13 +169,27 @@ export async function provisionServer({ pterodactylUserId, serverName, planName,
   const eggData = await panelFetch(`/nests/${NEST_ID}/eggs/${eggId}?include=variables`);
   const egg      = eggData.attributes;
 
-  // Pick docker image
+  // Pick docker image.
+  // The egg's docker_images map uses the label as key (e.g. "Java 21") → image URL.
+  // For Java versions not yet in the egg config (e.g. Java 25 for new calendar releases),
+  // we fall back to the known official yolks image directly.
+  const JAVA_IMAGE_FALLBACKS = {
+    "Java 25": "ghcr.io/pterodactyl/yolks:java_25",
+    "Java 21": "ghcr.io/pterodactyl/yolks:java_21",
+    "Java 17": "ghcr.io/pterodactyl/yolks:java_17",
+    "Java 16": "ghcr.io/pterodactyl/yolks:java_16",
+    "Java 11": "ghcr.io/pterodactyl/yolks:java_11",
+    "Java 8":  "ghcr.io/pterodactyl/yolks:java_8",
+  };
+
   const imageMap     = egg.docker_images ?? {};
   const imageKeys    = Object.keys(imageMap);
   const preferredKey = javaVersion && imageKeys.find(k => k === javaVersion);
   const dockerImage  = preferredKey
     ? imageMap[preferredKey]
-    : imageMap[imageKeys[0]] ?? egg.docker_image;
+    : (javaVersion && JAVA_IMAGE_FALLBACKS[javaVersion])
+      ?? imageMap[imageKeys[0]]
+      ?? egg.docker_image;
 
   // Build environment variables from egg defaults, overriding MC version
   const environment = {};

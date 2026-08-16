@@ -23,14 +23,33 @@ function save(servers) {
   writeFileSync(DB_PATH, JSON.stringify(servers, null, 2), "utf-8");
 }
 
-/** Get all servers belonging to a user. */
-export function getServersByUser(userId) {
-  return load().filter(s => s.userId === userId);
+/** Get all servers belonging to a user — matches by userId, with email fallback. */
+export function getServersByUser(userId, email) {
+  const servers = load();
+  const owned = servers.filter(s => s.userId === userId);
+  if (owned.length > 0 || !email) return owned;
+
+  // Fallback: match by email for servers created before userId was correctly set.
+  // Re-stamp userId so future lookups work correctly.
+  const byEmail = servers.filter(s => s.email === email && s.userId !== userId);
+  if (byEmail.length > 0) {
+    byEmail.forEach(s => { s.userId = userId; });
+    save(servers);
+  }
+  return byEmail;
 }
 
-/** Get a single server by ID, verifying ownership. */
-export function getServer(id, userId) {
-  return load().find(s => s.id === id && s.userId === userId) || null;
+/** Get a single server by ID, verifying ownership (userId or email). */
+export function getServer(id, userId, email) {
+  const servers = load();
+  const srv = servers.find(s => s.id === id && (s.userId === userId || (email && s.email === email)));
+  if (!srv) return null;
+  // Fix ownership if matched by email
+  if (srv.userId !== userId) {
+    srv.userId = userId;
+    save(servers);
+  }
+  return srv;
 }
 
 /** Get a server record by Pterodactyl server ID (panel-side ID). */

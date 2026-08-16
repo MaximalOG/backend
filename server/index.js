@@ -1032,7 +1032,7 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
 
   const spec = PLAN_SPECS[planKey];
   if (spec.priceInr !== 0) return res.status(400).json({ error: "Only free plans can use this endpoint." });
-  if (getServersByUser(req.user.id).some(server => server.planName === planKey)) {
+  if (getServersByUser(req.user.id, req.user.email).some(server => server.planName === planKey)) {
     return res.status(409).json({ error: "Your account has already claimed this free plan." });
   }
 
@@ -1081,7 +1081,7 @@ app.get("/api/server-types", (_req, res) => {
 // Find pending-setup servers by invoice orderId or by the logged-in user
 app.get("/api/servers/pending", requireUser, (req, res) => {
   const { orderId } = req.query;
-  const pending = getServersByUser(req.user.id).filter(s => s.status === "pending_setup");
+  const pending = getServersByUser(req.user.id, req.user.email).filter(s => s.status === "pending_setup");
   const matches = orderId ? pending.filter(s => s.invoiceOrderId === orderId) : pending;
   return res.json(matches.map(_serializeServer));
 });
@@ -1094,7 +1094,7 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
   if (!serverName?.trim()) return res.status(400).json({ error: "Server name is required." });
   if (!serverType)         return res.status(400).json({ error: "Server type is required." });
 
-  let srv = getServer(req.params.id, req.user.id);
+  let srv = getServer(req.params.id, req.user.id, req.user.email);
 
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (srv.status !== "pending_setup") {
@@ -1156,7 +1156,7 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
 
 // ── GET /api/servers ──────────────────────────────────────────────────────────
 app.get("/api/servers", requireUser, async (req, res) => {
-  const records = getServersByUser(req.user.id);
+  const records = getServersByUser(req.user.id, req.user.email);
 
   const PTERODACTYL_TIMEOUT_MS = 5000;
 
@@ -1200,7 +1200,7 @@ app.get("/api/servers", requireUser, async (req, res) => {
 
 // ── POST /api/servers/:id/start ───────────────────────────────────────────────
 app.post("/api/servers/:id/start", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id);
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found" });
   if (srv.status === "pending_setup") return res.status(400).json({ error: "Complete server setup first." });
   return res.status(501).json({ error: "Power controls are not available yet." });
@@ -1220,7 +1220,7 @@ app.post("/api/servers/:id/start", requireUser, async (req, res) => {
 
 // ── POST /api/servers/:id/stop ────────────────────────────────────────────────
 app.post("/api/servers/:id/stop", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id);
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found" });
   return res.status(501).json({ error: "Power controls are not available yet." });
 
@@ -1238,7 +1238,7 @@ app.post("/api/servers/:id/stop", requireUser, async (req, res) => {
 
 // ── GET /api/servers/:id/status ───────────────────────────────────────────────
 app.get("/api/servers/:id/status", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id);
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found" });
 
   if (!srv.pterodactylId) {
