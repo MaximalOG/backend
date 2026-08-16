@@ -1148,7 +1148,8 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
 
     // Update local record
     const updated = markServerProvisioned(srv.id, {
-      pterodactylId: ptServer.id,
+      pterodactylId:         ptServer.id,
+      pterodactylIdentifier: ptServer._identifier ?? null,
       connectionAddress,
       serverType,
       mcVersion: mcVersion || "latest",
@@ -1378,8 +1379,11 @@ app.get("/api/servers/:id/console-token", requireUser, async (req, res) => {
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
+  // Client API uses the short identifier (e.g. "23791ccb"), not the numeric ID
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+
   try {
-    const creds = await getConsoleCredentials(srv.pterodactylId);
+    const creds = await getConsoleCredentials(identifier);
     res.json(creds);
   } catch (err) {
     console.error("[Console] Token fetch failed:", err.message);
@@ -1398,9 +1402,12 @@ app.post("/api/servers/:id/power", requireUser, async (req, res) => {
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
+  // Client API uses the short identifier (e.g. "23791ccb"), not the numeric ID
+  const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
+
   try {
-    await sendPowerSignal(srv.pterodactylId, signal);
-    console.log(`[Power] ${signal} → server ${srv.id} (ptero ${srv.pterodactylId}) by ${req.user.email}`);
+    await sendPowerSignal(identifier, signal);
+    console.log(`[Power] ${signal} → server ${srv.id} (ptero ${identifier}) by ${req.user.email}`);
     res.json({ ok: true, signal });
   } catch (err) {
     console.error("[Power] Signal failed:", err.message);

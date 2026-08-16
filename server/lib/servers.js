@@ -99,20 +99,21 @@ export function beginServerProvisioning(id, userId) {
 
 /**
  * Mark a server as provisioned after Pterodactyl creates it.
- * Stores the Pterodactyl server ID, subdomain, type, version.
+ * Stores the Pterodactyl server ID, identifier, subdomain, type, version.
  */
-export function markServerProvisioned(id, { pterodactylId, connectionAddress, serverType, mcVersion, name }) {
+export function markServerProvisioned(id, { pterodactylId, pterodactylIdentifier, connectionAddress, serverType, mcVersion, name }) {
   const servers = load();
   const srv = servers.find(s => s.id === id);
   if (!srv) return null;
-  srv.pterodactylId  = pterodactylId;
-  srv.connectionAddress = connectionAddress ?? null;
-  srv.subdomain      = null;
-  srv.status         = "installing";   // Pterodactyl is installing the server
-  srv.serverType     = serverType ?? srv.serverType;
-  srv.mcVersion      = mcVersion  ?? srv.mcVersion;
-  if (name) srv.name = name;
-  srv.provisionedAt  = new Date().toISOString();
+  srv.pterodactylId         = pterodactylId;
+  srv.pterodactylIdentifier = pterodactylIdentifier ?? null;
+  srv.connectionAddress     = connectionAddress ?? null;
+  srv.subdomain             = null;
+  srv.status                = "installing";
+  srv.serverType            = serverType ?? srv.serverType;
+  srv.mcVersion             = mcVersion  ?? srv.mcVersion;
+  if (name) srv.name        = name;
+  srv.provisionedAt         = new Date().toISOString();
   save(servers);
   return srv;
 }

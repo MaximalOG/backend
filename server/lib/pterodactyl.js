@@ -244,9 +244,16 @@ export async function provisionServer({ pterodactylUserId, serverName, planName,
   // relationships.allocations.data[0].attributes — not as a top-level key.
   const allocAttrs = attrs.relationships?.allocations?.data?.[0]?.attributes ?? {};
   attrs._resolvedAllocation = {
-    ip:   allocAttrs.ip   ?? allocAttrs.alias ?? null,
+    // Prefer the public alias (e.g. mc.nethernodes.online) over the raw internal IP
+    ip:   allocAttrs.alias || allocAttrs.ip || null,
     port: allocAttrs.port ?? null,
   };
+
+  // identifier is the short 8-char string used by the Client API (e.g. "23791ccb")
+  // id is the numeric ID used by the Application API (e.g. 8)
+  // We expose both so callers can use the right one for each API.
+  attrs._numericId   = attrs.id;
+  attrs._identifier  = attrs.identifier;
 
   return attrs;
 }
@@ -313,14 +320,15 @@ export function getServerTypeConfig(typeId) {
 /**
  * Get a short-lived WebSocket token for a server's console.
  * Uses the Client API key — never exposed to the browser.
+ * pterodactylIdentifier: the short 8-char string (e.g. "23791ccb"), NOT the numeric ID.
  * Returns { token, socket } where socket is the wss:// URL.
  */
-export async function getConsoleCredentials(pterodactylServerId) {
+export async function getConsoleCredentials(pterodactylIdentifier) {
   const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
   const clientKey = process.env.PTERODACTYL_CLIENT_KEY || "";
   if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
 
-  const url = `${panelUrl}/api/client/servers/${pterodactylServerId}/websocket`;
+  const url = `${panelUrl}/api/client/servers/${pterodactylIdentifier}/websocket`;
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${clientKey}`,
@@ -342,14 +350,15 @@ export async function getConsoleCredentials(pterodactylServerId) {
 
 /**
  * Send a power signal to a server via the Client API.
+ * pterodactylIdentifier: the short 8-char string (e.g. "23791ccb"), NOT the numeric ID.
  * signal: "start" | "stop" | "restart" | "kill"
  */
-export async function sendPowerSignal(pterodactylServerId, signal) {
+export async function sendPowerSignal(pterodactylIdentifier, signal) {
   const panelUrl = process.env.PTERODACTYL_URL?.replace(/\/$/, "") || "";
   const clientKey = process.env.PTERODACTYL_CLIENT_KEY || "";
   if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
 
-  const url = `${panelUrl}/api/client/servers/${pterodactylServerId}/power`;
+  const url = `${panelUrl}/api/client/servers/${pterodactylIdentifier}/power`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
