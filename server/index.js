@@ -129,6 +129,7 @@ const allowedOrigins = [
   "http://localhost:8080",
   "https://nethernodes.online",
   "https://www.nethernodes.online",
+  "https://api.nethernodes.online",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -679,7 +680,7 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
     if (!order.mock) return res.status(400).json({ error: "Mock payments are not enabled for this order." });
   } else {
     if (!razorpay_signature) return res.status(400).json({ error: "Missing payment signature." });
-    const expectedSig = crypto.createHmac("sha256", `${razorpay_order_id}|${razorpay_payment_id}`).digest("hex");
+    const expectedSig = crypto.createHmac("sha256", secret).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest("hex");
     const expectedBuffer = Buffer.from(expectedSig);
     const receivedBuffer = Buffer.from(razorpay_signature);
     if (expectedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {

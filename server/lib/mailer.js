@@ -98,6 +98,20 @@ export async function sendTicketEmails(ticket) {
 }
 
 /**
+ * Convert **text** markdown bold syntax to HTML <strong> tags.
+ * Escapes HTML entities first to prevent injection.
+ */
+function renderMessageHtml(message) {
+  // Escape HTML entities
+  const escaped = message
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  // Convert **bold** to <strong>bold</strong>
+  return escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+}
+
+/**
  * Send a support reply from admin to the user.
  */
 export async function sendReplyEmail(ticket, message) {
@@ -109,6 +123,8 @@ export async function sendReplyEmail(ticket, message) {
     "In-Reply-To": ticket.messageId,
     "References": ticket.messageId,
   } : {};
+
+  const messageHtml = renderMessageHtml(message);
 
   await transport.sendMail({
     from,
@@ -122,7 +138,7 @@ export async function sendReplyEmail(ticket, message) {
         </div>
         <div style="background:#111;padding:20px;color:#ddd;border-radius:0 0 8px 8px">
           <p style="color:#888;font-size:12px;margin:0 0 12px">Reply to ticket <strong style="color:#fff">${ticket.id}</strong></p>
-          <div style="background:#1a1a1a;border-left:4px solid #e53935;padding:16px;border-radius:4px;white-space:pre-wrap;font-size:14px;line-height:1.6">${message}</div>
+          <div style="background:#1a1a1a;border-left:4px solid #e53935;padding:16px;border-radius:4px;white-space:pre-wrap;font-size:14px;line-height:1.6">${messageHtml}</div>
           <hr style="border-color:#333;margin:20px 0"/>
           <p style="color:#888;font-size:12px;margin:0">— NetherNodes Support Team<br/>Reply to this email or contact us at ${process.env.SUPPORT_EMAIL}</p>
         </div>
