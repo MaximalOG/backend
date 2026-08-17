@@ -1118,34 +1118,6 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
   });
   const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
   return res.json({ ok: true, planName: planKey, invoiceOrderId: issuedInvoice.orderId, serverId: pendingServer.id });
-
-  // Generate a fake invoice ID for tracking
-  const { createAndSendInvoice: legacyCreateAndSendInvoice } = await import("./lib/invoice.js");
-  let invoiceOrderId = null;
-  try {
-    const invoice = await legacyCreateAndSendInvoice({
-      userEmail, planName: planKey,
-      planRam: spec.ram,
-      originalPrice: 0, discountAmount: 0, finalPrice: 0,
-      currency: "INR",
-      razorpayPaymentId: "FREE", razorpayOrderId: "FREE",
-      couponLabel: "Free Plan",
-    });
-    invoiceOrderId = invoice.orderId;
-  } catch (err) {
-    console.warn("[ClaimFree] Invoice creation failed:", err.message);
-  }
-
-  // Provision async — respond immediately
-  res.json({ ok: true, planName: planKey, invoiceOrderId });
-
-  setImmediate(async () => {
-    try {
-      await _provisionAfterPayment({ userEmail, planName: planKey, userId: userId ?? null, invoiceOrderId });
-    } catch (err) {
-      console.error("[ClaimFree] Provision failed:", err.message);
-    }
-  });
 });
 // Returns the available server types for the setup wizard
 app.get("/api/server-types", (_req, res) => {
@@ -1180,15 +1152,6 @@ app.delete("/api/servers/:id", requireUser, async (req, res) => {
   deleteServerRecord(srv.id);
   console.log(`[Server] Deleted server record ${srv.id} for ${req.user.email}`);
   res.json({ ok: true });
-});
-// Find pending-setup servers by invoice orderId or by the logged-in user
-app.get("/api/servers/pending", requireUser, (req, res) => {
-  const { orderId } = req.query;
-  const pending = getServersByUser(req.user.id, req.user.email).filter(s => s.status === "pending_setup");
-  const matches = orderId ? pending.filter(s => s.invoiceOrderId === orderId) : pending;
-  return res.json(matches.map(_serializeServer));
-});
-
 });
 // Find pending-setup servers by invoice orderId or by the logged-in user
 app.get("/api/servers/pending", requireUser, (req, res) => {
