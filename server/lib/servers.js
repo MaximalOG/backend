@@ -68,17 +68,24 @@ export function createPendingServer({ userId, planName, email, ram, cpu, ssd, pt
     userId,
     planName,
     name:               `${planName} Server`,
-    status:             "pending_setup",   // awaiting user to complete setup wizard
+    status:             "pending_setup",
     ram,
     cpu,
     ssd,
-    subdomain:          null,              // set after Pterodactyl provisioning
-    pterodactylId:      null,              // set after Pterodactyl provisioning
+    subdomain:          null,
+    pterodactylId:      null,
+    pterodactylIdentifier: null,
     pterodactylUserId:  pterodactylUserId ?? null,
     invoiceOrderId:     invoiceOrderId ?? null,
     email,
     serverType:         null,
     mcVersion:          null,
+    // ── Custom domain fields ────────────────────────────────────────────────
+    hostname:           null,   // e.g. "survival" (the subdomain label only)
+    hostnameStatus:     null,   // "activating" | "active" | "error" | "removed"
+    cloudflareRecordId: null,   // Cloudflare DNS record ID for cleanup
+    hostnameCreatedAt:  null,
+    hostnameDeclined:   false,  // true if customer explicitly skipped the hostname step
     createdAt:          new Date().toISOString(),
     provisionedAt:      null,
   };
@@ -136,6 +143,30 @@ export function updateServer(id, fields) {
   Object.assign(srv, fields);
   save(servers);
   return srv;
+}
+
+/** Check if a hostname is already claimed by any server (excluding a given serverId). */
+export function isHostnameTaken(hostname, excludeServerId = null) {
+  const servers = load();
+  return servers.some(s =>
+    s.hostname === hostname &&
+    s.hostnameStatus !== "removed" &&
+    s.id !== excludeServerId
+  );
+}
+
+/** Clear hostname fields from a server record (on delete or manual removal). */
+export function clearServerHostname(id) {
+  const servers = load();
+  const srv = servers.find(s => s.id === id);
+  if (!srv) return false;
+  srv.hostname            = null;
+  srv.hostnameStatus      = null;
+  srv.cloudflareRecordId  = null;
+  srv.hostnameCreatedAt   = null;
+  srv.hostnameDeclined    = srv.hostnameDeclined ?? false; // preserve decline flag
+  save(servers);
+  return true;
 }
 
 /** Delete a server record. */

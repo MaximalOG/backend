@@ -35,11 +35,12 @@ import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js"
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword } from "./lib/userAuth.js";
-import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord } from "./lib/servers.js";
+import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
 import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal } from "./lib/pterodactyl.js";
 import { savePaymentOrder, getPaymentOrder, markPaymentOrderPaid } from "./lib/orders.js";
+import { validateHostname, parseHostname, fullHostname, createSrvRecord, updateSrvRecord, deleteSrvRecord, checkHostnameAvailability, listAllSrvRecords, RESERVED_NAMES } from "./lib/cloudflare.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -297,7 +298,7 @@ app.post("/api/chat", async (req, res) => {
     if (PLAN_LIST_TRIGGERS.some(t => lower.includes(t))) {
       const lines = ctx.AVAILABLE_PLANS.map(name => {
         const price = ctx.PRICING[name];
-        const spec = ctx.PLAN_SPECS[name];
+        const spec = ctx.getPlanSpecs()[name];
         return `🟢 ${name} — ${spec.ram} RAM · ${price}`;
       }).join("\n");
       return res.json({
@@ -339,7 +340,7 @@ app.post("/api/chat", async (req, res) => {
       showButtons:     !!actionMatch,
       recommendedPlan: recommendedPlan,
       ramRequired:     recommendedPlan
-        ? ctx.PLAN_SPECS[recommendedPlan]?.ram ?? null
+        ? ctx.getPlanSpecs()[recommendedPlan]?.ram ?? null
         : null,
       flowState:       null,
       planResult:      planResult ?? null,
@@ -578,15 +579,10 @@ function savePlanPrices(updates) {
   writeFileSync(PLAN_PRICES_PATH, JSON.stringify(merged, null, 2), "utf-8");
 }
 
-// PLAN_SPECS is re-evaluated on every request to pick up live price changes
-const PLAN_SPECS = new Proxy({}, {
-  get(_, key) { return loadPlanSpecs()[key]; },
-  ownKeys()   { return Object.keys(PLAN_SPECS_DEFAULT); },
-  has(_, key) { return key in PLAN_SPECS_DEFAULT; },
-  getOwnPropertyDescriptor(_, key) {
-    return key in PLAN_SPECS_DEFAULT ? { enumerable: true, configurable: true } : undefined;
-  },
-});
+// PLAN_SPECS — always read fresh from disk so price changes apply instantly.
+// Use loadPlanSpecs() directly instead of this constant for iteration.
+// This alias exists for single-key lookups: getPlanSpecs()[planName]
+const getPlanSpecs = loadPlanSpecs;
 
 // ── GET /api/admin/plans ──────────────────────────────────────────────────────
 app.get("/api/admin/plans", requireAuth, requireOwner, (_req, res) => {
@@ -620,11 +616,11 @@ app.get("/api/plans", (_req, res) => {
 
 app.get("/api/plans/:name", (req, res) => {
   // Case-insensitive lookup — "starter" and "Starter" both work
-  const key = Object.keys(PLAN_SPECS).find(
+  const key = Object.keys(getPlanSpecs()).find(
     k => k.toLowerCase() === req.params.name.toLowerCase()
   );
   if (!key) return res.status(404).json({ error: "Plan not found" });
-  const spec = PLAN_SPECS[key];
+  const spec = getPlanSpecs()[key];
   const country = req.headers["cf-ipcountry"] || "IN";
   const price = country === "IN"
     ? { currency: "INR", amount: spec.priceInr }
@@ -651,12 +647,12 @@ app.post("/api/create-order", requireUser, async (req, res) => {
   }
 
   // 1. Look up plan price server-side — never trust frontend price
-  const planKey = Object.keys(PLAN_SPECS).find(
+  const planKey = Object.keys(getPlanSpecs()).find(
     k => k.toLowerCase() === String(planName).toLowerCase()
   );
   if (!planKey) return res.status(400).json({ error: "Invalid plan" });
 
-  const originalPrice = PLAN_SPECS[planKey].priceInr;
+  const originalPrice = getPlanSpecs()[planKey].priceInr;
   console.log(`[Order] Plan: ${planKey} | Original: ₹${originalPrice}`);
 
   if (originalPrice === 0) {
@@ -763,7 +759,7 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
 
   const paidOrder = markPaymentOrderPaid(razorpay_order_id, razorpay_payment_id);
   if (!paidOrder) return res.status(409).json({ error: "This payment was already processed." });
-  const planSpec = PLAN_SPECS[paidOrder.planName];
+  const planSpec = getPlanSpecs()[paidOrder.planName];
   const invoice = await createAndSendInvoice({
     userEmail: req.user.email, planName: paidOrder.planName, planRam: planSpec.ram,
     originalPrice: paidOrder.originalPrice, discountAmount: paidOrder.discountAmount,
@@ -781,7 +777,7 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
   if (!secret || secret === "REPLACE_ME") {
     // Dev mode — mock verification + invoice
     console.log("[Payment] Mock verification for", planName, userEmail);
-    const planSpec = PLAN_SPECS[planName] || {};
+    const planSpec = getPlanSpecs()[planName] || {};
     const invoice = await createAndSendInvoice({
       userEmail, planName,
       planRam: planSpec.ram || "N/A",
@@ -807,7 +803,7 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
   console.log("[Payment] Verified:", razorpay_payment_id, "for", planName, userEmail);
 
   // Generate invoice and send email
-  const planSpec = PLAN_SPECS[planName] || {};
+  const planSpec = getPlanSpecs()[planName] || {};
   const invoice = await createAndSendInvoice({
     userEmail, planName,
     planRam: planSpec.ram || "N/A",
@@ -1095,10 +1091,10 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
   const { planName } = req.body;
   if (!planName) return res.status(400).json({ error: "planName is required." });
 
-  const planKey = Object.keys(PLAN_SPECS).find(k => k.toLowerCase() === String(planName).toLowerCase());
+  const planKey = Object.keys(getPlanSpecs()).find(k => k.toLowerCase() === String(planName).toLowerCase());
   if (!planKey) return res.status(400).json({ error: "Invalid plan." });
 
-  const spec = PLAN_SPECS[planKey];
+  const spec = getPlanSpecs()[planKey];
   if (spec.priceInr !== 0) return res.status(400).json({ error: "Only free plans can use this endpoint." });
 
   const existing = getServersByUser(req.user.id, req.user.email).filter(s => s.planName === planKey);
@@ -1161,6 +1157,16 @@ app.delete("/api/servers/:id", requireUser, async (req, res) => {
   const srv = getServer(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
 
+  // Delete Cloudflare DNS record if one exists
+  if (srv.cloudflareRecordId) {
+    try {
+      await deleteSrvRecord(srv.cloudflareRecordId);
+    } catch (err) {
+      console.error("[Server] Cloudflare cleanup failed:", err.message);
+      // Log but continue — don't block deletion
+    }
+  }
+
   // Delete from Pterodactyl if it was provisioned
   if (srv.pterodactylId) {
     try {
@@ -1168,7 +1174,6 @@ app.delete("/api/servers/:id", requireUser, async (req, res) => {
       console.log(`[Server] Deleted Pterodactyl server ${srv.pterodactylId} for ${req.user.email}`);
     } catch (err) {
       console.error("[Server] Pterodactyl delete failed:", err.message);
-      // Continue — still remove our local record even if panel deletion fails
     }
   }
 
@@ -1184,7 +1189,189 @@ app.get("/api/servers/pending", requireUser, (req, res) => {
   return res.json(matches.map(_serializeServer));
 });
 
-// ── POST /api/servers/:id/setup ───────────────────────────────────────────────
+});
+// Find pending-setup servers by invoice orderId or by the logged-in user
+app.get("/api/servers/pending", requireUser, (req, res) => {
+  const { orderId } = req.query;
+  const pending = getServersByUser(req.user.id, req.user.email).filter(s => s.status === "pending_setup");
+  const matches = orderId ? pending.filter(s => s.invoiceOrderId === orderId) : pending;
+  return res.json(matches.map(_serializeServer));
+});
+
+// ── Hostname rate limiter ─────────────────────────────────────────────────────
+const hostnameCheckLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many checks. Please wait a minute." },
+});
+const hostnameWriteLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many hostname requests. Please wait 5 minutes." },
+});
+
+// ── GET /api/hostnames/check ──────────────────────────────────────────────────
+app.get("/api/hostnames/check", hostnameCheckLimiter, async (req, res) => {
+  const { name } = req.query;
+  const validErr = validateHostname(name);
+  if (validErr) return res.json({ available: false, reason: validErr });
+  const clean = parseHostname(name);
+  if (isHostnameTaken(clean)) return res.json({ available: false, reason: "That name is already taken." });
+  try {
+    const cfOk = await checkHostnameAvailability(clean);
+    return res.json({ available: cfOk, reason: cfOk ? null : "That name is already in use." });
+  } catch {
+    return res.json({ available: true, reason: null }); // CF unreachable — rely on DB
+  }
+});
+
+// ── GET /api/servers/:id/hostname ─────────────────────────────────────────────
+app.get("/api/servers/:id/hostname", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  res.json({
+    hostname:         srv.hostname ?? null,
+    hostnameStatus:   srv.hostnameStatus ?? null,
+    hostnameDeclined: srv.hostnameDeclined ?? false,
+    customAddress:    srv.hostname ? `${srv.hostname}.nethernodes.online` : null,
+  });
+});
+
+// ── POST /api/servers/:id/hostname ────────────────────────────────────────────
+app.post("/api/servers/:id/hostname", requireUser, hostnameWriteLimiter, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server must be provisioned before setting a hostname." });
+  if (srv.hostname) return res.status(409).json({ error: "This server already has a hostname. Use PUT to change it." });
+
+  const { name } = req.body;
+  const validErr = validateHostname(name);
+  if (validErr) return res.status(400).json({ error: validErr });
+  const clean = parseHostname(name);
+
+  if (isHostnameTaken(clean)) return res.status(409).json({ error: "That hostname is already taken." });
+
+  const port = _extractPort(srv.connectionAddress);
+  if (!port) return res.status(400).json({ error: "Server has no port assigned yet. Please wait for provisioning to complete." });
+
+  // Immediately mark activating so UI shows spinner
+  updateServer(srv.id, { hostname: clean, hostnameStatus: "activating", hostnameDeclined: false });
+
+  try {
+    const recordId = await createSrvRecord(clean, port);
+    updateServer(srv.id, {
+      hostname:           clean,
+      hostnameStatus:     "active",
+      cloudflareRecordId: recordId,
+      hostnameCreatedAt:  new Date().toISOString(),
+    });
+    console.log(`[Hostname] Created ${clean}.nethernodes.online for server ${srv.id}`);
+    res.json({ hostname: clean, hostnameStatus: "active", customAddress: `${clean}.nethernodes.online` });
+  } catch (err) {
+    updateServer(srv.id, { hostname: null, hostnameStatus: "error", cloudflareRecordId: null });
+    console.error(`[Hostname] Create failed for ${clean}:`, err.message);
+    res.status(502).json({ error: "Failed to create DNS record. Please try again." });
+  }
+});
+
+// ── PUT /api/servers/:id/hostname ─────────────────────────────────────────────
+app.put("/api/servers/:id/hostname", requireUser, hostnameWriteLimiter, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server must be provisioned." });
+
+  const { name } = req.body;
+  const validErr = validateHostname(name);
+  if (validErr) return res.status(400).json({ error: validErr });
+  const clean = parseHostname(name);
+  if (clean === srv.hostname) {
+    return res.json({ hostname: clean, hostnameStatus: srv.hostnameStatus, customAddress: `${clean}.nethernodes.online` });
+  }
+  if (isHostnameTaken(clean, srv.id)) return res.status(409).json({ error: "That hostname is already taken." });
+
+  const port = _extractPort(srv.connectionAddress);
+  if (!port) return res.status(400).json({ error: "Server has no port assigned yet." });
+
+  const oldHostname    = srv.hostname;
+  const oldRecordId    = srv.cloudflareRecordId;
+  const oldStatus      = srv.hostnameStatus;
+
+  updateServer(srv.id, { hostname: clean, hostnameStatus: "activating" });
+
+  try {
+    const newRecordId = await createSrvRecord(clean, port);
+    // Delete old record non-fatally
+    if (oldRecordId) {
+      try { await deleteSrvRecord(oldRecordId); } catch (e) {
+        console.warn(`[Hostname] Old record ${oldRecordId} cleanup failed:`, e.message);
+      }
+    }
+    updateServer(srv.id, {
+      hostname:           clean,
+      hostnameStatus:     "active",
+      cloudflareRecordId: newRecordId,
+      hostnameCreatedAt:  new Date().toISOString(),
+    });
+    console.log(`[Hostname] Changed to ${clean}.nethernodes.online for server ${srv.id}`);
+    res.json({ hostname: clean, hostnameStatus: "active", customAddress: `${clean}.nethernodes.online` });
+  } catch (err) {
+    // Roll back
+    updateServer(srv.id, { hostname: oldHostname, hostnameStatus: oldStatus, cloudflareRecordId: oldRecordId });
+    console.error(`[Hostname] Change failed for ${clean}:`, err.message);
+    res.status(502).json({ error: "Failed to update DNS record. Please try again." });
+  }
+});
+
+// ── DELETE /api/servers/:id/hostname ─────────────────────────────────────────
+app.delete("/api/servers/:id/hostname", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.hostname) return res.status(404).json({ error: "This server has no hostname." });
+  if (srv.cloudflareRecordId) {
+    try { await deleteSrvRecord(srv.cloudflareRecordId); }
+    catch (err) { console.error("[Hostname] CF delete failed:", err.message); }
+  }
+  clearServerHostname(srv.id);
+  res.json({ ok: true });
+});
+
+// ── POST /api/servers/:id/hostname/decline ────────────────────────────────────
+app.post("/api/servers/:id/hostname/decline", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  updateServer(srv.id, { hostnameDeclined: true });
+  res.json({ ok: true });
+});
+
+// ── GET /api/admin/hostnames ──────────────────────────────────────────────────
+app.get("/api/admin/hostnames", requireAuth, (_req, res) => {
+  const serversPath = resolve(__dirname, "../data/servers.json");
+  let servers = [];
+  try { if (existsSync(serversPath)) servers = JSON.parse(readFileSync(serversPath, "utf-8")); } catch {}
+  const withHostnames = servers.filter(s => s.hostname).map(s => ({
+    serverId: s.id, serverName: s.name, email: s.email,
+    hostname: s.hostname, customAddress: `${s.hostname}.nethernodes.online`,
+    hostnameStatus: s.hostnameStatus, cloudflareRecordId: s.cloudflareRecordId,
+    hostnameCreatedAt: s.hostnameCreatedAt, connectionAddress: s.connectionAddress,
+  }));
+  res.json(withHostnames);
+});
+
+// ── POST /api/admin/hostnames/:serverId/sync ──────────────────────────────────
+app.post("/api/admin/hostnames/:serverId/sync", requireAuth, async (req, res) => {
+  const serversPath = resolve(__dirname, "../data/servers.json");
+  let servers = [];
+  try { if (existsSync(serversPath)) servers = JSON.parse(readFileSync(serversPath, "utf-8")); } catch {}
+  const srv = servers.find(s => s.id === req.params.serverId);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.hostname) return res.status(400).json({ error: "Server has no hostname." });
+  const port = _extractPort(srv.connectionAddress);
+  if (!port) return res.status(400).json({ error: "No port available." });
+  try {
+    if (srv.cloudflareRecordId) { try { await deleteSrvRecord(srv.cloudflareRecordId); } catch {} }
+    const recordId = await createSrvRecord(srv.hostname, port);
+    updateServer(srv.id, { cloudflareRecordId: recordId, hostnameStatus: "active" });
+    res.json({ ok: true, recordId });
+  } catch (err) { res.status(502).json({ error: err.message }); }
+});
 // Called from the setup wizard — provisions the actual Pterodactyl server
 app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
   const { serverName, serverType, mcVersion, javaVersion } = req.body;
@@ -1354,9 +1541,17 @@ app.get("/api/servers/:id/status", requireUser, async (req, res) => {
   }
 });
 
+// ── Helper: extract port number from "ip:port" connection address ─────────────
+function _extractPort(connectionAddress) {
+  if (!connectionAddress) return null;
+  const parts = connectionAddress.split(":");
+  const port = parseInt(parts[parts.length - 1], 10);
+  return isNaN(port) ? null : port;
+}
+
 // ── Helper: provision Pterodactyl user+server after payment ───────────────────
 function _createPendingServerForUser({ user, planName, invoiceOrderId }) {
-  const spec = PLAN_SPECS[planName];
+  const spec = getPlanSpecs()[planName];
   if (!spec) throw new Error("Unknown plan.");
   return createPendingServer({
     userId: user.id, planName, email: user.email,
@@ -1370,7 +1565,7 @@ async function _provisionAfterPayment({ userEmail, planName, userId, invoiceOrde
     return;
   }
 
-  const spec = PLAN_SPECS[planName];
+  const spec = getPlanSpecs()[planName];
   if (!spec) { console.warn("[Pterodactyl] Unknown plan:", planName); return; }
 
   const ptUser = await ensurePterodactylUser({
@@ -1432,20 +1627,24 @@ function _mapPterodactylStatus(ptSrv) {
 // ── Helper: serialize server for frontend (never expose panel URL) ────────────
 function _serializeServer(srv) {
   return {
-    id:          srv.id,
-    name:        srv.name,
-    status:      srv.status,
-    ram:         srv.ram,
-    cpu:         srv.cpu,
-    ssd:         srv.ssd,
-    plan:        srv.planName,
-    subdomain:   srv.connectionAddress,
-    serverType:  srv.serverType,
-    mcVersion:   srv.mcVersion,
-    pendingSetup: srv.status === "pending_setup",
-    createdAt:   srv.createdAt,
-    // The allocation address is safe connection metadata; never expose the panel URL.
-    host:        srv.connectionAddress || null,
+    id:                  srv.id,
+    name:                srv.name,
+    status:              srv.status,
+    ram:                 srv.ram,
+    cpu:                 srv.cpu,
+    ssd:                 srv.ssd,
+    plan:                srv.planName,
+    subdomain:           srv.connectionAddress,
+    serverType:          srv.serverType,
+    mcVersion:           srv.mcVersion,
+    pendingSetup:        srv.status === "pending_setup",
+    createdAt:           srv.createdAt,
+    host:                srv.connectionAddress || null,
+    // Custom domain fields
+    hostname:            srv.hostname ?? null,
+    hostnameStatus:      srv.hostnameStatus ?? null,
+    hostnameDeclined:    srv.hostnameDeclined ?? false,
+    customAddress:       srv.hostname ? `${srv.hostname}.nethernodes.online` : null,
   };
 }
 
