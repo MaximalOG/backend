@@ -700,7 +700,22 @@ app.post("/api/create-order", requireUser, async (req, res) => {
   console.log(`[Order] Original: ₹${originalPrice} | Discount: ₹${discountAmount} | Final: ₹${finalPrice}`);
 
   if (finalPrice === 0) {
-    return res.status(400).json({ error: "Coupon makes this plan free — no payment needed." });
+    // Coupon makes it fully free — provision directly without Razorpay
+    const issuedInvoice = await createAndSendInvoice({
+      userEmail: req.user.email, planName: planKey, planRam: getPlanSpecs()[planKey].ram,
+      originalPrice, discountAmount, finalPrice: 0, currency: "INR",
+      razorpayPaymentId: "COUPON_FREE", razorpayOrderId: `COUPON_${Date.now()}`,
+      couponLabel: couponLabel || "100% Coupon",
+    });
+    const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
+    console.log(`[Order] Coupon 100% — provisioned free server for ${req.user.email} (${planKey})`);
+    return res.json({
+      free:          true,
+      verified:      true,
+      orderId:       issuedInvoice.orderId,
+      serverId:      pendingServer.id,
+      originalPrice, discountAmount, finalPrice: 0, couponLabel,
+    });
   }
 
   try {
