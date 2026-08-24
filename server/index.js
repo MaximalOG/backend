@@ -41,6 +41,7 @@ import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invo
 import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal } from "./lib/pterodactyl.js";
 import { savePaymentOrder, getPaymentOrder, markPaymentOrderPaid } from "./lib/orders.js";
 import { validateHostname, parseHostname, fullHostname, createSrvRecord, updateSrvRecord, deleteSrvRecord, checkHostnameAvailability, listAllSrvRecords, RESERVED_NAMES } from "./lib/cloudflare.js";
+import botRouter from "./bot.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -1948,6 +1949,9 @@ app.post("/api/servers/:id/power", requireUser, async (req, res) => {
     res.status(502).json({ error: "Could not send power signal. Please try again." });
   }
 });
+
+// ── Bot API ───────────────────────────────────────────────────────────────────
+app.use("/bot", botRouter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
