@@ -71,7 +71,25 @@ function publicUser(user) {
     username:      user.username,
     email:         user.email,
     emailVerified: user.emailVerified,
+    discordId:     user.discordId ?? null,
   };
+}
+
+// ── Update a single field on a user (used for Discord linking) ────────────────
+export function updateUserField(userId, fields) {
+  const users = loadUsers();
+  const user  = users.find(u => u.id === userId);
+  if (!user) return null;
+  Object.assign(user, fields);
+  saveUsers(users);
+  return publicUser(user);
+}
+
+/** Find a user by discordId. */
+export function getUserByDiscordId(discordId) {
+  const users = loadUsers();
+  const user  = users.find(u => u.discordId === discordId);
+  return user ? publicUser(user) : null;
 }
 
 // ── Signup ────────────────────────────────────────────────────────────────────

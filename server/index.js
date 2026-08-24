@@ -34,7 +34,7 @@ import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
 import { createOrder } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
-import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword } from "./lib/userAuth.js";
+import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword, updateUserField, getUserByDiscordId } from "./lib/userAuth.js";
 import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
@@ -1952,6 +1952,66 @@ app.post("/api/servers/:id/power", requireUser, async (req, res) => {
 
 // ── Bot API ───────────────────────────────────────────────────────────────────
 app.use("/bot", botRouter);
+
+// ── POST /api/account/link-discord ───────────────────────────────────────────
+// User submits their link code from the website — validates with bot, saves discordId.
+app.post("/api/account/link-discord", requireUser, async (req, res) => {
+  const { code } = req.body;
+  if (!code || typeof code !== "string") return res.status(400).json({ error: "code is required." });
+
+  const clean = code.trim().toUpperCase();
+
+  // Validate the code via the bot router's in-memory store
+  // We call the same Express route internally by importing botRouter's linkCodes
+  // — simpler: just duplicate the verify logic since bot.js exports the Map via the router
+  // The cleanest approach: call the /bot/verify-link endpoint internally
+  const botKey = process.env.BOT_API_KEY;
+  if (!botKey) return res.status(503).json({ error: "Bot API not configured." });
+
+  try {
+    // Internal call to /bot/verify-link — same Express app, avoids network round trip
+    const verifyRes = await fetch(`http://localhost:${process.env.API_PORT || 3001}/bot/verify-link?code=${encodeURIComponent(clean)}`, {
+      headers: { "x-bot-key": botKey },
+    });
+    if (!verifyRes.ok) {
+      const err = await verifyRes.json();
+      return res.status(400).json({ error: err.error || "Invalid or expired code." });
+    }
+    const { discordId, discordUsername } = await verifyRes.json();
+
+    // Check this Discord account isn't already linked to a different user
+    const existingUser = getUserByDiscordId(discordId);
+    if (existingUser && existingUser.id !== req.user.id) {
+      return res.status(409).json({ error: "This Discord account is already linked to a different NetherNodes account." });
+    }
+
+    // Save discordId to the user's account
+    const updated = updateUserField(req.user.id, { discordId, discordUsername: discordUsername ?? null });
+    if (!updated) return res.status(404).json({ error: "User not found." });
+
+    // Notify the bot — assign Customer role, send confirmation DM
+    await fetch(`http://localhost:${process.env.API_PORT || 3001}/bot/link-confirmed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-bot-key": botKey },
+      body: JSON.stringify({ discordId, userId: req.user.id, email: req.user.email, code: clean }),
+    }).catch(err => console.warn("[Discord Link] Confirmation notify failed:", err.message));
+
+    console.log(`[Discord Link] ${req.user.email} linked to Discord ${discordId}`);
+    res.json({ ok: true, discordId, discordUsername: discordUsername ?? null });
+  } catch (err) {
+    console.error("[Discord Link] Error:", err.message);
+    res.status(500).json({ error: "Failed to link account. Please try again." });
+  }
+});
+
+// ── DELETE /api/account/link-discord ─────────────────────────────────────────
+// Unlink Discord account.
+app.delete("/api/account/link-discord", requireUser, (req, res) => {
+  const updated = updateUserField(req.user.id, { discordId: null, discordUsername: null });
+  if (!updated) return res.status(404).json({ error: "User not found." });
+  console.log(`[Discord Link] ${req.user.email} unlinked Discord`);
+  res.json({ ok: true });
+});
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {

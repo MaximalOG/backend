@@ -18,6 +18,26 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 
+// ── Link code store (in-memory, expires in 10 min) ────────────────────────────
+// Map: code → { discordId, expiresAt }
+const linkCodes = new Map();
+const LINK_CODE_TTL = 10 * 60 * 1000; // 10 minutes
+
+function generateLinkCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "NN-";
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// Clean up expired codes every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of linkCodes) {
+    if (now > data.expiresAt) linkCodes.delete(code);
+  }
+}, 5 * 60 * 1000);
+
 // ── Bot auth middleware ───────────────────────────────────────────────────────
 router.use((req, res, next) => {
   const key = req.headers["x-bot-key"];
@@ -244,6 +264,90 @@ router.get("/stats", (req, res) => {
     openTickets:         tickets.filter(t => t.status === "open").length,
     pendingTickets:      tickets.filter(t => t.status === "pending").length,
   });
+});
+
+// ── POST /bot/generate-link-code ──────────────────────────────────────────────
+// Bot calls this when user runs /link in Discord.
+// Returns a one-time code the user enters on the website.
+router.post("/generate-link-code", (req, res) => {
+  const { discordId, discordUsername } = req.body;
+  if (!discordId) return res.status(400).json({ error: "discordId is required." });
+
+  // Check if this Discord account is already linked
+  const users = loadJson("users_app.json");
+  const existing = users.find(u => u.discordId === discordId);
+  if (existing) {
+    return res.json({
+      alreadyLinked: true,
+      email: existing.email,
+      username: existing.username,
+    });
+  }
+
+  // Invalidate any existing codes for this discordId
+  for (const [code, data] of linkCodes) {
+    if (data.discordId === discordId) linkCodes.delete(code);
+  }
+
+  const code = generateLinkCode();
+  linkCodes.set(code, {
+    discordId,
+    discordUsername: discordUsername ?? null,
+    expiresAt: Date.now() + LINK_CODE_TTL,
+  });
+
+  console.log(`[Bot] Link code generated for Discord ${discordId}: ${code}`);
+  res.json({ code, expiresIn: "10 minutes" });
+});
+
+// ── GET /bot/verify-link ──────────────────────────────────────────────────────
+// Backend calls this when user submits their code on the website.
+// Returns the discordId if code is valid and not expired.
+router.get("/verify-link", (req, res) => {
+  const code = (req.query.code ?? "").trim().toUpperCase();
+  if (!code) return res.status(400).json({ error: "code is required." });
+
+  const data = linkCodes.get(code);
+  if (!data) return res.status(404).json({ error: "Invalid or expired code." });
+  if (Date.now() > data.expiresAt) {
+    linkCodes.delete(code);
+    return res.status(410).json({ error: "Code has expired. Run /link again in Discord." });
+  }
+
+  res.json({ discordId: data.discordId, discordUsername: data.discordUsername });
+});
+
+// ── POST /bot/link-confirmed ──────────────────────────────────────────────────
+// Backend calls this after successfully saving discordId to the user account.
+// Bot uses this to assign the Customer role and send a confirmation DM.
+// The bot's own server should call an internal handler — for now we log it.
+// When the bot adds a webhook receiver, it will POST to this endpoint from Discord.
+router.post("/link-confirmed", (req, res) => {
+  const { discordId, userId, email, code } = req.body;
+  if (!discordId || !userId) return res.status(400).json({ error: "discordId and userId are required." });
+
+  // Remove the used code
+  if (code) linkCodes.delete(code.toUpperCase());
+  else {
+    // Remove any code for this discordId
+    for (const [c, d] of linkCodes) {
+      if (d.discordId === discordId) { linkCodes.delete(c); break; }
+    }
+  }
+
+  console.log(`[Bot] Account linked — Discord: ${discordId} → NetherNodes user: ${userId} (${email})`);
+  // The Discord bot listens for this confirmation to assign roles / send DM.
+  // POST this to the bot's own internal webhook if the bot runs a local server.
+  const botWebhook = process.env.BOT_WEBHOOK_URL;
+  if (botWebhook) {
+    fetch(botWebhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.BOT_API_KEY },
+      body: JSON.stringify({ event: "link_confirmed", discordId, userId, email }),
+    }).catch(err => console.warn("[Bot] Webhook delivery failed:", err.message));
+  }
+
+  res.json({ ok: true });
 });
 
 export default router;
