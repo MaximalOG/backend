@@ -32,7 +32,7 @@ import { sendTicketEmails, sendReplyEmail } from "./lib/mailer.js";import { vali
 import { startGmailPoller } from "./lib/gmailPoller.js";
 import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
-import { createOrder } from "./lib/payment.js";
+import { createOrder, ensureRazorpayPlan, createRazorpaySubscription, cancelRazorpaySubscription, getRazorpaySubscription } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword, updateUserField, getUserByDiscordId } from "./lib/userAuth.js";
 import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
@@ -40,6 +40,17 @@ import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } fr
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
 import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal } from "./lib/pterodactyl.js";
 import { savePaymentOrder, getPaymentOrder, markPaymentOrderPaid } from "./lib/orders.js";
+import { searchProjects, getProject, getBestVersion, LOADER_DIR } from "./lib/modrinth.js";
+import { installFile, deleteFile as deleteInstalledFile, listFiles as listInstalledFiles, logInstall, logUninstall, getInstallerHistory } from "./lib/installer.js";
+import {
+  createSubscription as createSubRecord,
+  getSubscriptionByRazorpayId,
+  getSubscriptionByServerId,
+  getSubscriptionsByUserId,
+  updateSubscription,
+  recordPayment,
+  getPaymentHistory,
+} from "./lib/subscriptions.js";
 import { validateHostname, parseHostname, fullHostname, createSrvRecord, updateSrvRecord, deleteSrvRecord, checkHostnameAvailability, listAllSrvRecords, RESERVED_NAMES } from "./lib/cloudflare.js";
 import botRouter from "./bot.js";
 import crypto from "crypto";
@@ -160,6 +171,10 @@ app.set("etag", false);
 
 // Trust Cloudflare proxy — required for express-rate-limit behind Cloudflare
 app.set("trust proxy", 1);
+
+// ── Raw body capture for Razorpay webhook (must come BEFORE express.json) ────
+// Only the webhook route gets the raw body — all other routes use parsed JSON.
+app.use("/api/webhooks/razorpay", express.raw({ type: "application/json" }));
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -720,29 +735,67 @@ app.post("/api/create-order", requireUser, async (req, res) => {
   }
 
   try {
-    const order = await createOrder({
-      planName: planKey,
-      planPrice: finalPrice,   // discounted price goes to Razorpay
-      currency: currency || "INR",
-      userEmail: req.user.email,
+    // For paid plans, create a Razorpay Subscription (not a one-time order)
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const isMockMode = !keyId || keyId === "rzp_test_REPLACE_ME";
+
+    if (isMockMode) {
+      // Dev/mock mode — use one-time order as before
+      const order = await createOrder({
+        planName: planKey, planPrice: finalPrice, currency: currency || "INR", userEmail: req.user.email,
+      });
+      savePaymentOrder({
+        providerOrderId: order.orderId, userId: req.user.id, userEmail: req.user.email,
+        planName: planKey, originalPrice, discountAmount, finalPrice, couponLabel,
+        currency: "INR", mock: true, status: "created", createdAt: new Date().toISOString(),
+      });
+      return res.json({ ...order, originalPrice, discountAmount, finalPrice, couponLabel });
+    }
+
+    // Production — create Razorpay Plan (cached) then Subscription
+    const razorpayPlanId = await ensureRazorpayPlan(planKey, finalPrice);
+    const rzpSub = await createRazorpaySubscription({
+      planId:      razorpayPlanId,
+      userEmail:   req.user.email,
+      userName:    req.user.name,
+      totalCount:  120, // 10 years
     });
 
+    // Create the pending server record now so we have a serverId to reference
+    const issuedInvoice = await createAndSendInvoice({
+      userEmail: req.user.email, planName: planKey, planRam: getPlanSpecs()[planKey].ram,
+      originalPrice, discountAmount, finalPrice, currency: "INR",
+      razorpayPaymentId: rzpSub.id, razorpayOrderId: rzpSub.id,
+      couponLabel: couponLabel || null,
+    });
+    const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
+
+    // Save a payment order record linking subscription → server
     savePaymentOrder({
-      providerOrderId: order.orderId,
-      userId: req.user.id,
-      userEmail: req.user.email,
-      planName: planKey,
+      providerOrderId: rzpSub.id,
+      userId:          req.user.id,
+      userEmail:       req.user.email,
+      planName:        planKey,
       originalPrice, discountAmount, finalPrice, couponLabel,
-      currency: "INR", mock: Boolean(order.mock), status: "created",
-      createdAt: new Date().toISOString(),
+      currency:        "INR",
+      mock:            false,
+      status:          "subscription_created",
+      razorpayPlanId,
+      linkedServerId:  pendingServer.id,
+      createdAt:       new Date().toISOString(),
     });
 
-    res.json({
-      ...order,
-      originalPrice,
-      discountAmount,
-      finalPrice,
-      couponLabel,
+    console.log(`[Order] Subscription created: ${rzpSub.id} for ${req.user.email} (${planKey} ₹${finalPrice}/mo) → server ${pendingServer.id}`);
+
+    return res.json({
+      subscriptionMode:  true,
+      subscriptionId:    rzpSub.id,
+      keyId,
+      planName:          planKey,
+      serverId:          pendingServer.id,
+      invoiceOrderId:    issuedInvoice.orderId,
+      originalPrice, discountAmount, finalPrice, couponLabel,
+      shortUrl:          rzpSub.short_url ?? null,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1897,10 +1950,13 @@ app.delete("/api/servers/:id/files", requireUser, async (req, res) => {
 
   const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
 
+  // Strip any extra fields — Pterodactyl only wants { name: string }
+  const cleanFiles = files.map(f => ({ name: f.name }));
+
   try {
     await clientFetch(identifier, "/files/delete", {
       method: "POST",
-      body: JSON.stringify({ root: "/", files }),
+      body: JSON.stringify({ root: "/", files: cleanFiles }),
     });
     res.json({ ok: true });
   } catch (err) {
@@ -1947,6 +2003,272 @@ app.post("/api/servers/:id/power", requireUser, async (req, res) => {
   } catch (err) {
     console.error("[Power] Signal failed:", err.message);
     res.status(502).json({ error: "Could not send power signal. Please try again." });
+  }
+});
+
+// ── GET /api/servers/:id/subscription ────────────────────────────────────────
+app.get("/api/servers/:id/subscription", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  const sub = getSubscriptionByServerId(srv.id);
+  if (!sub) return res.json({ subscription: null });
+  res.json({ subscription: {
+    id:                    sub.id,
+    razorpaySubscriptionId: sub.razorpaySubscriptionId,
+    status:                sub.status,
+    planName:              sub.planName,
+    amountInr:             sub.amountInr,
+    nextBillingDate:       sub.nextBillingDate,
+    currentPeriodEnd:      sub.currentPeriodEnd,
+    gracePeriodEnd:        sub.gracePeriodEnd,
+    createdAt:             sub.createdAt,
+    activatedAt:           sub.activatedAt,
+    cancelledAt:           sub.cancelledAt,
+  }});
+});
+
+// ── GET /api/servers/:id/subscription/history ─────────────────────────────────
+app.get("/api/servers/:id/subscription/history", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  const sub = getSubscriptionByServerId(srv.id);
+  if (!sub) return res.json([]);
+  res.json(getPaymentHistory(sub.razorpaySubscriptionId));
+});
+
+// ── POST /api/servers/:id/subscription/cancel ─────────────────────────────────
+app.post("/api/servers/:id/subscription/cancel", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  const sub = getSubscriptionByServerId(srv.id);
+  if (!sub) return res.status(404).json({ error: "No subscription found for this server." });
+  if (sub.status === "cancelled") return res.status(409).json({ error: "Subscription is already cancelled." });
+
+  const { immediate = false } = req.body;
+  try {
+    await cancelRazorpaySubscription(sub.razorpaySubscriptionId, immediate);
+    updateSubscription(sub.razorpaySubscriptionId, {
+      status:      "cancelled",
+      cancelledAt: new Date().toISOString(),
+    });
+    updateServer(srv.id, { subscriptionStatus: "cancelled" });
+    console.log(`[Subscription] Cancelled ${sub.razorpaySubscriptionId} by user ${req.user.email}`);
+    res.json({ ok: true, cancelledAt: new Date().toISOString() });
+  } catch (err) {
+    res.status(502).json({ error: "Failed to cancel subscription: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/subscription/link ───────────────────────────────────
+// Called by frontend after Razorpay subscription payment completes.
+// Links the Razorpay subscription to the server record.
+app.post("/api/servers/:id/subscription/link", requireUser, async (req, res) => {
+  const { razorpaySubscriptionId, razorpayPaymentId } = req.body;
+  if (!razorpaySubscriptionId) return res.status(400).json({ error: "razorpaySubscriptionId is required." });
+
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+
+  // Verify the subscription belongs to a known payment order for this user
+  const savedOrder = getPaymentOrder(razorpaySubscriptionId);
+  if (!savedOrder || savedOrder.userId !== req.user.id) {
+    return res.status(404).json({ error: "Subscription order not found." });
+  }
+  if (savedOrder.status !== "subscription_created") {
+    return res.status(409).json({ error: "Subscription already processed." });
+  }
+
+  // Create subscription record
+  const subRecord = createSubRecord({
+    razorpaySubscriptionId,
+    razorpayPlanId:  savedOrder.razorpayPlanId,
+    serverId:        srv.id,
+    userId:          req.user.id,
+    userEmail:       req.user.email,
+    planName:        savedOrder.planName,
+    amountInr:       savedOrder.finalPrice,
+  });
+
+  // Link to server
+  updateServer(srv.id, {
+    subscriptionId:     subRecord.id,
+    razorpaySubId:      razorpaySubscriptionId,
+    subscriptionStatus: "active",
+  });
+
+  // Mark order as linked
+  const orders = (() => { try { return JSON.parse(readFileSync(resolve(__dirname, "../data/payment_orders.json"), "utf-8")); } catch { return []; } })();
+  const oi = orders.findIndex(o => o.providerOrderId === razorpaySubscriptionId);
+  if (oi >= 0) { orders[oi].status = "linked"; orders[oi].linkedServerId = srv.id; writeFileSync(resolve(__dirname, "../data/payment_orders.json"), JSON.stringify(orders, null, 2)); }
+
+  // Issue invoice
+  const planSpec = getPlanSpecs()[savedOrder.planName];
+  const invoice = await createAndSendInvoice({
+    userEmail: req.user.email, planName: savedOrder.planName, planRam: planSpec?.ram ?? "N/A",
+    originalPrice: savedOrder.originalPrice, discountAmount: savedOrder.discountAmount,
+    finalPrice: savedOrder.finalPrice, currency: "INR",
+    razorpayPaymentId: razorpayPaymentId ?? razorpaySubscriptionId,
+    razorpayOrderId: razorpaySubscriptionId,
+    couponLabel: savedOrder.couponLabel,
+  });
+
+  console.log(`[Subscription] Linked ${razorpaySubscriptionId} to server ${srv.id}`);
+  res.json({ ok: true, orderId: invoice.orderId, serverId: srv.id });
+});
+
+// ── Installer rate limiter ────────────────────────────────────────────────────
+const installerSearchLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many search requests. Please wait a minute." },
+});
+const installerInstallLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many install requests. Please wait 5 minutes." },
+});
+
+// ── GET /api/installer/search ─────────────────────────────────────────────────
+app.get("/api/installer/search", requireUser, installerSearchLimiter, async (req, res) => {
+  const { q = "", type = "all", page = "0", serverId } = req.query;
+
+  let serverSoftware, mcVersion;
+  if (serverId) {
+    const srv = getServer(serverId, req.user.id, req.user.email);
+    if (srv) { serverSoftware = srv.serverType; mcVersion = srv.mcVersion; }
+  }
+
+  try {
+    const results = await searchProjects({
+      query:          q,
+      type,
+      serverSoftware,
+      mcVersion,
+      page:           parseInt(page, 10) || 0,
+      limit:          20,
+    });
+    res.json(results);
+  } catch (err) {
+    res.status(502).json({ error: "Modrinth search failed: " + err.message });
+  }
+});
+
+// ── GET /api/installer/project/:projectId ─────────────────────────────────────
+app.get("/api/installer/project/:projectId", requireUser, installerSearchLimiter, async (req, res) => {
+  try {
+    const project = await getProject(req.params.projectId);
+    res.json(project);
+  } catch (err) {
+    res.status(502).json({ error: "Failed to fetch project: " + err.message });
+  }
+});
+
+// ── POST /api/installer/install ───────────────────────────────────────────────
+app.post("/api/installer/install", requireUser, installerInstallLimiter, async (req, res) => {
+  const { serverId, projectId, versionId } = req.body;
+  if (!serverId || !projectId) return res.status(400).json({ error: "serverId and projectId are required." });
+
+  const srv = getServer(serverId, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  const serverSoftware = srv.serverType ?? "paper";
+  const mcVersion      = srv.mcVersion  ?? null;
+
+  try {
+    let version;
+    if (versionId) {
+      // Specific version requested
+      const project = await getProject(projectId);
+      version = project.versions?.find(v => v.id === versionId) ?? await getBestVersion(projectId, { mcVersion, serverSoftware });
+    } else {
+      version = await getBestVersion(projectId, { mcVersion, serverSoftware });
+    }
+
+    if (!version) {
+      return res.status(422).json({ error: `No compatible version found for ${serverSoftware} ${mcVersion ?? ""}. Check the plugin supports your server software and Minecraft version.` });
+    }
+    if (!version.fileUrl || !version.filename) {
+      return res.status(422).json({ error: "No downloadable file found for this version." });
+    }
+
+    // Determine install directory
+    const loader = version.loaders?.[0] ?? serverSoftware;
+    const targetDir = LOADER_DIR[loader] ?? LOADER_DIR[serverSoftware] ?? "plugins";
+
+    const installedFilename = await installFile({
+      identifier: srv.pterodactylIdentifier,
+      fileUrl:    version.fileUrl,
+      filename:   version.filename,
+      targetDir,
+    });
+
+    // Fetch project name for history
+    const project = await getProject(projectId).catch(() => ({ title: projectId }));
+
+    logInstall({
+      serverId:      srv.id,
+      userId:        req.user.id,
+      projectId,
+      projectName:   project.title,
+      version:       version.versionNumber,
+      loader,
+      installedFile: installedFilename,
+    });
+
+    console.log(`[Installer] ${project.title} v${version.versionNumber} → ${targetDir}/${installedFilename} on server ${srv.id}`);
+
+    res.json({
+      ok:            true,
+      filename:      installedFilename,
+      directory:     targetDir,
+      projectName:   project.title,
+      version:       version.versionNumber,
+      loader,
+    });
+  } catch (err) {
+    console.error("[Installer] Install failed:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ── GET /api/installer/installed/:serverId ────────────────────────────────────
+app.get("/api/installer/installed/:serverId", requireUser, async (req, res) => {
+  const srv = getServer(req.params.serverId, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.json({ plugins: [], mods: [], history: [] });
+
+  try {
+    const [plugins, mods] = await Promise.all([
+      listInstalledFiles({ identifier: srv.pterodactylIdentifier, dir: "plugins" }),
+      listInstalledFiles({ identifier: srv.pterodactylIdentifier, dir: "mods" }),
+    ]);
+    const history = getInstallerHistory(srv.id);
+    res.json({ plugins, mods, history });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ── DELETE /api/installer/remove ─────────────────────────────────────────────
+app.delete("/api/installer/remove", requireUser, async (req, res) => {
+  const { serverId, filename, directory } = req.body;
+  if (!serverId || !filename || !directory) {
+    return res.status(400).json({ error: "serverId, filename, and directory are required." });
+  }
+  if (!["plugins", "mods"].includes(directory)) {
+    return res.status(400).json({ error: "directory must be 'plugins' or 'mods'." });
+  }
+
+  const srv = getServer(serverId, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  try {
+    await deleteInstalledFile({ identifier: srv.pterodactylIdentifier, targetDir: directory, filename });
+    logUninstall({ serverId: srv.id, userId: req.user.id, projectId: null, projectName: filename, filename });
+    console.log(`[Installer] Removed ${directory}/${filename} from server ${srv.id}`);
+    res.json({ ok: true, filename, directory });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 });
 
@@ -2016,6 +2338,180 @@ app.delete("/api/account/link-discord", requireUser, (req, res) => {
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Top-level /health alias — useful for load balancer / proxy checks
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "NetherNodes API" });
+});
+
+// ── POST /api/webhooks/razorpay ───────────────────────────────────────────────
+// Razorpay sends signed webhook events here.
+// Raw body is captured above so we can verify the HMAC signature.
+app.post("/api/webhooks/razorpay", (req, res) => {
+  const signature = req.headers["x-razorpay-signature"];
+  const secret    = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+  // --- Signature verification ---
+  if (!secret) {
+    console.error("[Webhook] RAZORPAY_WEBHOOK_SECRET is not set.");
+    return res.status(500).json({ error: "Webhook secret not configured." });
+  }
+  if (!signature) {
+    console.warn("[Webhook] Missing X-Razorpay-Signature header.");
+    return res.status(401).json({ error: "Missing signature." });
+  }
+
+  const rawBody = req.body; // Buffer (express.raw gave us this)
+  if (!rawBody || !rawBody.length) {
+    return res.status(400).json({ error: "Empty request body." });
+  }
+
+  const expectedSig = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
+
+  if (expectedSig !== signature) {
+    console.warn("[Webhook] Invalid Razorpay signature — rejected.");
+    return res.status(401).json({ error: "Invalid signature." });
+  }
+
+  // --- Parse payload ---
+  let payload;
+  try {
+    payload = JSON.parse(rawBody.toString("utf-8"));
+  } catch {
+    return res.status(400).json({ error: "Malformed JSON payload." });
+  }
+
+  const event          = payload.event ?? "unknown";
+  const paymentId      = payload.payload?.payment?.entity?.id ?? null;
+  const subscriptionId = payload.payload?.subscription?.entity?.id ?? null;
+
+  console.log(`[Webhook] Razorpay event: ${event}`);
+  if (paymentId)      console.log(`[Webhook] Payment ID: ${paymentId}`);
+  if (subscriptionId) console.log(`[Webhook] Subscription ID: ${subscriptionId}`);
+
+  // --- Handle events ---
+  switch (event) {
+    case "subscription.activated": {
+      if (!subscriptionId) break;
+      const sub = getSubscriptionByRazorpayId(subscriptionId);
+      if (!sub) { console.warn(`[Webhook] No sub record for ${subscriptionId}`); break; }
+
+      updateSubscription(subscriptionId, {
+        status:      "active",
+        activatedAt: new Date().toISOString(),
+        nextBillingDate: payload.payload?.subscription?.entity?.charge_at
+          ? new Date(payload.payload.subscription.entity.charge_at * 1000).toISOString()
+          : null,
+        currentPeriodEnd: payload.payload?.subscription?.entity?.current_end
+          ? new Date(payload.payload.subscription.entity.current_end * 1000).toISOString()
+          : null,
+      });
+
+      // Mark server subscription fields
+      updateServer(sub.serverId, {
+        subscriptionStatus: "active",
+        razorpaySubId:       subscriptionId,
+        expiryDate: payload.payload?.subscription?.entity?.current_end
+          ? new Date(payload.payload.subscription.entity.current_end * 1000).toISOString()
+          : null,
+      });
+
+      // Unsuspend server if it was previously suspended
+      const srv = (() => { const all = []; try { const d = readFileSync(resolve(__dirname, "../data/servers.json"), "utf-8"); return JSON.parse(d); } catch { return []; } })().find(s => s.id === sub.serverId);
+      if (srv?.pterodactylId && srv?.status === "suspended") {
+        unsuspendServer(srv.pterodactylId).catch(e => console.warn("[Webhook] Unsuspend failed:", e.message));
+      }
+
+      recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr: null, status: "activated", event });
+      console.log(`[Webhook] Subscription ${subscriptionId} activated for server ${sub.serverId}`);
+      break;
+    }
+
+    case "payment.captured": {
+      if (!subscriptionId) break;
+      const entity = payload.payload?.payment?.entity;
+      const amountInr = entity?.amount ? entity.amount / 100 : null;
+
+      // Extend server expiry by 30 days
+      const expiryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const sub = getSubscriptionByRazorpayId(subscriptionId);
+
+      if (sub) {
+        const nextBilling = payload.payload?.subscription?.entity?.charge_at
+          ? new Date(payload.payload.subscription.entity.charge_at * 1000).toISOString()
+          : null;
+
+        updateSubscription(subscriptionId, {
+          status:          "active",
+          gracePeriodEnd:  null,
+          nextBillingDate: nextBilling,
+          currentPeriodEnd: expiryDate,
+        });
+        updateServer(sub.serverId, {
+          subscriptionStatus: "active",
+          expiryDate,
+        });
+        recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr, status: "captured", event });
+        console.log(`[Webhook] Payment captured ${paymentId} for sub ${subscriptionId} — expiry extended to ${expiryDate}`);
+      } else {
+        // Could be a first payment where subscription isn't recorded yet — log it
+        console.warn(`[Webhook] payment.captured but no subscription record for ${subscriptionId}`);
+        recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr, status: "captured", event });
+      }
+      break;
+    }
+
+    case "payment.failed": {
+      if (!subscriptionId) break;
+      const gracePeriodEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+      const sub = getSubscriptionByRazorpayId(subscriptionId);
+
+      if (sub) {
+        updateSubscription(subscriptionId, { status: "pending_payment", gracePeriodEnd });
+        updateServer(sub.serverId, { subscriptionStatus: "pending_payment" });
+        recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr: null, status: "failed", event });
+        console.log(`[Webhook] Payment failed for sub ${subscriptionId} — 3-day grace period until ${gracePeriodEnd}`);
+      }
+      break;
+    }
+
+    case "subscription.halted":
+    case "subscription.cancelled": {
+      if (!subscriptionId) break;
+      const sub = getSubscriptionByRazorpayId(subscriptionId);
+
+      if (sub) {
+        updateSubscription(subscriptionId, {
+          status:       event === "subscription.cancelled" ? "cancelled" : "halted",
+          cancelledAt:  new Date().toISOString(),
+        });
+        updateServer(sub.serverId, {
+          subscriptionStatus: event === "subscription.cancelled" ? "cancelled" : "halted",
+        });
+
+        // Suspend server through Pterodactyl
+        const allServers = (() => { try { return JSON.parse(readFileSync(resolve(__dirname, "../data/servers.json"), "utf-8")); } catch { return []; } })();
+        const srv = allServers.find(s => s.id === sub.serverId);
+        if (srv?.pterodactylId) {
+          suspendServer(srv.pterodactylId).catch(e => console.warn("[Webhook] Suspend failed:", e.message));
+          console.log(`[Webhook] Server ${srv.id} suspended due to ${event}`);
+        }
+        recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: null, amountInr: null, status: event, event });
+      }
+      console.log(`[Webhook] Subscription ${event}: ${subscriptionId}`);
+      break;
+    }
+
+    default:
+      console.log(`[Webhook] Unhandled event type: ${event} — ignored.`);
+  }
+
+  // Always return 200 to acknowledge receipt (Razorpay retries on non-200)
+  res.status(200).json({ received: true });
 });
 app.post("/api/feedback", (req, res) => {
   const { ticketId, email, rating, comment } = req.body;

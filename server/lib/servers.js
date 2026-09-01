@@ -86,6 +86,11 @@ export function createPendingServer({ userId, planName, email, ram, cpu, ssd, pt
     cloudflareRecordId: null,   // Cloudflare DNS record ID for cleanup
     hostnameCreatedAt:  null,
     hostnameDeclined:   false,  // true if customer explicitly skipped the hostname step
+    // ── Subscription fields ─────────────────────────────────────────────────
+    subscriptionId:     null,   // internal sub_xxx ID from subscriptions.json
+    razorpaySubId:      null,   // Razorpay subscription ID
+    subscriptionStatus: null,   // active | pending_payment | halted | cancelled
+    expiryDate:         null,   // ISO — when current paid period ends
     createdAt:          new Date().toISOString(),
     provisionedAt:      null,
   };
