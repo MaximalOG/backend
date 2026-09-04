@@ -735,67 +735,31 @@ app.post("/api/create-order", requireUser, async (req, res) => {
   }
 
   try {
-    // For paid plans, create a Razorpay Subscription (not a one-time order)
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const isMockMode = !keyId || keyId === "rzp_test_REPLACE_ME";
-
-    if (isMockMode) {
-      // Dev/mock mode — use one-time order as before
-      const order = await createOrder({
-        planName: planKey, planPrice: finalPrice, currency: currency || "INR", userEmail: req.user.email,
-      });
-      savePaymentOrder({
-        providerOrderId: order.orderId, userId: req.user.id, userEmail: req.user.email,
-        planName: planKey, originalPrice, discountAmount, finalPrice, couponLabel,
-        currency: "INR", mock: true, status: "created", createdAt: new Date().toISOString(),
-      });
-      return res.json({ ...order, originalPrice, discountAmount, finalPrice, couponLabel });
-    }
-
-    // Production — create Razorpay Plan (cached) then Subscription
-    const razorpayPlanId = await ensureRazorpayPlan(planKey, finalPrice);
-    const rzpSub = await createRazorpaySubscription({
-      planId:      razorpayPlanId,
-      userEmail:   req.user.email,
-      userName:    req.user.name,
-      totalCount:  120, // 10 years
+    // Use one-time payment orders — subscription billing requires additional
+    // Razorpay dashboard configuration and is disabled until fully set up.
+    const order = await createOrder({
+      planName: planKey,
+      planPrice: finalPrice,
+      currency: currency || "INR",
+      userEmail: req.user.email,
     });
 
-    // Create the pending server record now so we have a serverId to reference
-    const issuedInvoice = await createAndSendInvoice({
-      userEmail: req.user.email, planName: planKey, planRam: getPlanSpecs()[planKey].ram,
-      originalPrice, discountAmount, finalPrice, currency: "INR",
-      razorpayPaymentId: rzpSub.id, razorpayOrderId: rzpSub.id,
-      couponLabel: couponLabel || null,
-    });
-    const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
-
-    // Save a payment order record linking subscription → server
     savePaymentOrder({
-      providerOrderId: rzpSub.id,
-      userId:          req.user.id,
-      userEmail:       req.user.email,
-      planName:        planKey,
+      providerOrderId: order.orderId,
+      userId: req.user.id,
+      userEmail: req.user.email,
+      planName: planKey,
       originalPrice, discountAmount, finalPrice, couponLabel,
-      currency:        "INR",
-      mock:            false,
-      status:          "subscription_created",
-      razorpayPlanId,
-      linkedServerId:  pendingServer.id,
-      createdAt:       new Date().toISOString(),
+      currency: "INR", mock: Boolean(order.mock), status: "created",
+      createdAt: new Date().toISOString(),
     });
 
-    console.log(`[Order] Subscription created: ${rzpSub.id} for ${req.user.email} (${planKey} ₹${finalPrice}/mo) → server ${pendingServer.id}`);
-
-    return res.json({
-      subscriptionMode:  true,
-      subscriptionId:    rzpSub.id,
-      keyId,
-      planName:          planKey,
-      serverId:          pendingServer.id,
-      invoiceOrderId:    issuedInvoice.orderId,
-      originalPrice, discountAmount, finalPrice, couponLabel,
-      shortUrl:          rzpSub.short_url ?? null,
+    res.json({
+      ...order,
+      originalPrice,
+      discountAmount,
+      finalPrice,
+      couponLabel,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
