@@ -30,7 +30,7 @@ import { buildAIContext } from "./lib/config.js";
 import { createTicket, getAllTickets, updateTicketStatus, addReply, clearClosedTickets } from "./lib/tickets.js";
 import { sendTicketEmails, sendReplyEmail } from "./lib/mailer.js";import { validateEmail } from "./lib/emailValidator.js";
 import { startGmailPoller } from "./lib/gmailPoller.js";
-import { getSale, saveSale, getActiveSale, validateCode } from "./lib/sale.js";
+import { getSale, saveSale, getActiveSale, validateCode, incrementCodeUsage } from "./lib/sale.js";
 import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js";
 import { createOrder, ensureRazorpayPlan, createRazorpaySubscription, cancelRazorpaySubscription, getRazorpaySubscription } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
@@ -680,9 +680,18 @@ app.post("/api/create-order", requireUser, async (req, res) => {
   let couponLabel = null;
 
   if (couponCode && couponCode.trim()) {
-    // Explicit coupon code provided — validate it
     const coupon = validateCode(couponCode.trim());
     if (coupon) {
+      // Enforce plan restriction
+      const couponPlans = coupon.plans ?? "all";
+      const planAllowed = couponPlans === "all" ||
+        (Array.isArray(couponPlans) && couponPlans.map(p => p.toLowerCase()).includes(planKey.toLowerCase()));
+
+      if (!planAllowed) {
+        console.log(`[Order] Coupon ${couponCode} not valid for plan ${planKey}`);
+        return res.status(400).json({ error: `This coupon is not valid for the ${planKey} plan.` });
+      }
+
       if (coupon.discountType === "percent") {
         discountAmount = Math.round(originalPrice * (coupon.discount / 100));
       } else {
@@ -691,7 +700,7 @@ app.post("/api/create-order", requireUser, async (req, res) => {
       couponLabel = coupon.label;
       console.log(`[Order] Coupon: ${couponCode} (${coupon.discountType}) | Discount: ₹${discountAmount}`);
     } else {
-      console.log(`[Order] Coupon invalid or expired: ${couponCode}`);
+      console.log(`[Order] Coupon invalid, expired, or exhausted: ${couponCode}`);
     }
   } else {
     // No explicit code — check if a public banner sale is active and apply it automatically
@@ -746,10 +755,11 @@ app.post("/api/create-order", requireUser, async (req, res) => {
 
     savePaymentOrder({
       providerOrderId: order.orderId,
-      userId: req.user.id,
+      userId:    req.user.id,
       userEmail: req.user.email,
-      planName: planKey,
+      planName:  planKey,
       originalPrice, discountAmount, finalPrice, couponLabel,
+      couponCode: couponCode?.trim()?.toUpperCase() ?? null,  // store raw code for usage tracking
       currency: "INR", mock: Boolean(order.mock), status: "created",
       createdAt: new Date().toISOString(),
     });
@@ -792,6 +802,18 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
 
   const paidOrder = markPaymentOrderPaid(razorpay_order_id, razorpay_payment_id);
   if (!paidOrder) return res.status(409).json({ error: "This payment was already processed." });
+
+  // Increment coupon usage count if a code was applied
+  if (paidOrder.couponLabel && paidOrder.providerOrderId) {
+    // Find the original coupon code from the order's couponCode field (if stored)
+    // We stored couponLabel, not the raw code — increment by matching label isn't reliable.
+    // Instead check payment_orders for couponCode field saved at order creation.
+    const savedOrder = getPaymentOrder(razorpay_order_id);
+    if (savedOrder?.couponCode) {
+      incrementCodeUsage(savedOrder.couponCode);
+      console.log(`[Order] Coupon usage incremented: ${savedOrder.couponCode}`);
+    }
+  }
   const planSpec = getPlanSpecs()[paidOrder.planName];
   const invoice = await createAndSendInvoice({
     userEmail: req.user.email, planName: paidOrder.planName, planRam: planSpec.ram,
@@ -1440,41 +1462,42 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
 app.get("/api/servers", requireUser, async (req, res) => {
   const records = getServersByUser(req.user.id, req.user.email);
 
-  const PTERODACTYL_TIMEOUT_MS = 5000;
-
   const enriched = await Promise.allSettled(
     records.map(async srv => {
-      // Servers not yet provisioned on Pterodactyl — return as-is
       if (!srv.pterodactylId) return _serializeServer(srv);
 
-      // Attempt live status fetch with a hard timeout
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), PTERODACTYL_TIMEOUT_MS);
-      try {
-        const ptSrv = await getPterodactylServer(srv.pterodactylId, controller.signal);
-        clearTimeout(timer);
-        if (ptSrv) {
-          const liveStatus = _mapPterodactylStatus(ptSrv);
-          updateServer(srv.id, { status: liveStatus });
-          return _serializeServer({ ...srv, status: liveStatus });
+      // Prefer Client API for live status (returns running/offline accurately)
+      // Fall back to Application API which only knows suspended/installing
+      if (srv.pterodactylIdentifier) {
+        const clientStatus = await _getServerStatusViaClient(srv.pterodactylIdentifier);
+        if (clientStatus) {
+          updateServer(srv.id, { status: clientStatus });
+          return _serializeServer({ ...srv, status: clientStatus });
         }
-        // Panel returned nothing — status unknown
-        return _serializeServer({ ...srv, status: "unknown" });
-      } catch (err) {
-        clearTimeout(timer);
-        // Timeout or network error — do not claim "stopped", use "unknown"
-        const isTimeout = err?.name === "AbortError" || err?.message?.includes("abort");
-        console.warn(`[Pterodactyl] Status fetch ${isTimeout ? "timed out" : "failed"} for server ${srv.pterodactylId}`);
-        return _serializeServer({ ...srv, status: "unknown" });
       }
+
+      // Fallback: Application API (handles suspended/installing states)
+      try {
+        const ptSrv = await getPterodactylServer(srv.pterodactylId, null);
+        if (ptSrv) {
+          const appStatus = _mapPterodactylStatus(ptSrv);
+          // Only use app status for definitive states; unknown stays as last known
+          if (appStatus !== "unknown") {
+            updateServer(srv.id, { status: appStatus });
+            return _serializeServer({ ...srv, status: appStatus });
+          }
+        }
+      } catch { /* non-fatal */ }
+
+      // Neither API returned a clear status — keep last known
+      return _serializeServer(srv);
     })
   );
 
-  // allSettled: extract values; fulfilled = normal result, rejected = unexpected
   const results = enriched.map((outcome, i) => {
     if (outcome.status === "fulfilled") return outcome.value;
-    console.error("[Pterodactyl] Unexpected rejection for server", records[i]?.id, outcome.reason);
-    return _serializeServer({ ...records[i], status: "unknown" });
+    console.error("[Pterodactyl] Status fetch rejection for server", records[i]?.id, outcome.reason);
+    return _serializeServer(records[i]);
   });
 
   res.json(results);
@@ -1595,6 +1618,37 @@ async function _provisionAfterPayment({ userEmail, planName, userId, invoiceOrde
   });
 
   console.log(`[Pterodactyl] Pending server record created for ${userEmail} (${planName}). User ID: ${ptUser.id}`);
+}
+
+// ── Helper: get live server status via Client API (more reliable than App API) ─
+async function _getServerStatusViaClient(pterodactylIdentifier) {
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return null;
+
+  try {
+    const res = await fetch(
+      `${panelUrl}/api/client/servers/${pterodactylIdentifier}/resources`,
+      {
+        headers: {
+          Authorization: `Bearer ${clientKey}`,
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const state = data?.attributes?.current_state;
+    // Pterodactyl Client API states: running, stopping, starting, offline
+    if (state === "running")  return "running";
+    if (state === "stopping") return "stopping";
+    if (state === "starting") return "starting";
+    if (state === "offline")  return "stopped";
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Helper: map Pterodactyl Application API response to our status strings ────

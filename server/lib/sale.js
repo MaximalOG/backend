@@ -47,7 +47,7 @@ export function getActiveSale() {
 
 /** Validate a promo code against single or multi-code config. */
 export function validateCode(code) {
-  const sale = getSale(); // use getSale not getActiveSale — codes work independently of banner
+  const sale = getSale();
   if (!sale) return null;
 
   const input = code.trim().toLowerCase();
@@ -56,19 +56,38 @@ export function validateCode(code) {
   if (Array.isArray(sale.codes) && sale.codes.length > 0) {
     const match = sale.codes.find(c => c.code?.trim().toLowerCase() === input);
     if (match) {
+      // Check max uses
+      if (match.maxUses && match.maxUses > 0) {
+        const used = match.usedCount ?? 0;
+        if (used >= match.maxUses) return null; // exhausted
+      }
       return {
-        discount: match.discount ?? sale.discount,
+        discount:     match.discount     ?? sale.discount,
         discountType: match.discountType ?? sale.discountType,
-        label: match.name ? `${match.name} Discount` : sale.label,
-        codeName: match.name,
+        label:        match.name ? `${match.name} Discount` : sale.label,
+        codeName:     match.name,
+        plans:        match.plans ?? "all",   // "all" or array of plan names
+        maxUses:      match.maxUses  ?? null,
+        usedCount:    match.usedCount ?? 0,
       };
     }
   }
 
   // Single secret code fallback
   if (sale.code && sale.code.trim().toLowerCase() === input) {
-    return { discount: sale.discount, discountType: sale.discountType, label: sale.label };
+    return { discount: sale.discount, discountType: sale.discountType, label: sale.label, plans: sale.plans ?? "all" };
   }
 
   return null;
+}
+
+/** Increment the use count for a code. Called after a successful payment. */
+export function incrementCodeUsage(code) {
+  const sale = getSale();
+  if (!Array.isArray(sale.codes)) return;
+  const input = code.trim().toLowerCase();
+  const match = sale.codes.find(c => c.code?.trim().toLowerCase() === input);
+  if (!match) return;
+  match.usedCount = (match.usedCount ?? 0) + 1;
+  saveSale(sale);
 }
