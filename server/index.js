@@ -1981,8 +1981,8 @@ app.delete("/api/servers/:id/files", requireUser, async (req, res) => {
 
   const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
 
-  // Strip any extra fields — Pterodactyl only wants { name: string }
-  const cleanFiles = files.map(f => ({ name: f.name }));
+  // Pterodactyl Client API expects files as an array of strings (paths), not objects
+  const cleanFiles = files.map(f => f.name ?? f);
 
   try {
     await clientFetch(identifier, "/files/delete", {
