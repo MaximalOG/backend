@@ -733,6 +733,8 @@ app.post("/api/create-order", requireUser, async (req, res) => {
       couponLabel: couponLabel || "100% Coupon",
     });
     const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
+    // Increment coupon usage for free-via-coupon path
+    if (couponCode?.trim()) incrementCodeUsage(couponCode.trim());
     console.log(`[Order] Coupon 100% — provisioned free server for ${req.user.email} (${planKey})`);
     return res.json({
       free:          true,
@@ -804,15 +806,9 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
   if (!paidOrder) return res.status(409).json({ error: "This payment was already processed." });
 
   // Increment coupon usage count if a code was applied
-  if (paidOrder.couponLabel && paidOrder.providerOrderId) {
-    // Find the original coupon code from the order's couponCode field (if stored)
-    // We stored couponLabel, not the raw code — increment by matching label isn't reliable.
-    // Instead check payment_orders for couponCode field saved at order creation.
-    const savedOrder = getPaymentOrder(razorpay_order_id);
-    if (savedOrder?.couponCode) {
-      incrementCodeUsage(savedOrder.couponCode);
-      console.log(`[Order] Coupon usage incremented: ${savedOrder.couponCode}`);
-    }
+  if (paidOrder.couponCode) {
+    incrementCodeUsage(paidOrder.couponCode);
+    console.log(`[Order] Coupon usage incremented: ${paidOrder.couponCode}`);
   }
   const planSpec = getPlanSpecs()[paidOrder.planName];
   const invoice = await createAndSendInvoice({
@@ -928,11 +924,28 @@ app.get("/api/sale", (_req, res) => {
 
 // ── POST /api/sale/validate-code ──────────────────────────────────────────────
 app.post("/api/sale/validate-code", (req, res) => {
-  const { code } = req.body;
+  const { code, planName } = req.body;
   if (!code) return res.status(400).json({ error: "code is required" });
   const result = validateCode(code);
   if (!result) return res.status(404).json({ error: "Invalid or expired code" });
-  res.json(result);
+
+  // If planName provided, enforce plan restriction immediately
+  if (planName) {
+    const couponPlans = result.plans ?? "all";
+    const planAllowed = couponPlans === "all" ||
+      (Array.isArray(couponPlans) && couponPlans.map(p => p.toLowerCase()).includes(planName.toLowerCase()));
+    if (!planAllowed) {
+      const allowedList = Array.isArray(couponPlans) ? couponPlans.join(", ") : "all";
+      return res.status(404).json({ error: `This code is only valid for: ${allowedList}` });
+    }
+  }
+
+  // Never expose plans/usedCount/maxUses to frontend — just the discount info
+  res.json({
+    discount:     result.discount,
+    discountType: result.discountType,
+    label:        result.label,
+  });
 });
 
 // ── GET /api/admin/sale ───────────────────────────────────────────────────────
