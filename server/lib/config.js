@@ -2,15 +2,15 @@
 // Edit this file to update plans, pricing, features — AI picks it up instantly.
 
 export const PLANS = [
-  { name: "Nano",    ram: "1GB",  ramGB: 1,  price: "₹69/month",    cpu: "50%",  ssd: "5GB"   },
+  { name: "Nano",    ram: "1GB",  ramGB: 1,  price: "₹69/month",    cpu: "75%",  ssd: "5GB"   },
   { name: "Basic",   ram: "2GB",  ramGB: 2,  price: "Free",         cpu: "100%", ssd: "10GB"  },
   { name: "Plus",    ram: "3GB",  ramGB: 3,  price: "₹129/month",   cpu: "150%", ssd: "15GB"  },
   { name: "Starter", ram: "4GB",  ramGB: 4,  price: "₹199/month",   cpu: "200%", ssd: "25GB"  },
   { name: "Pro",     ram: "6GB",  ramGB: 6,  price: "₹329/month",   cpu: "250%", ssd: "40GB"  },
   { name: "Elite",   ram: "8GB",  ramGB: 8,  price: "₹469/month",   cpu: "300%", ssd: "60GB"  },
   { name: "Ultra",   ram: "10GB", ramGB: 10, price: "₹649/month",   cpu: "350%", ssd: "80GB"  },
-  { name: "Max",     ram: "12GB", ramGB: 12, price: "₹829/month",   cpu: "400%", ssd: "100GB" },
-  { name: "Titan",   ram: "16GB", ramGB: 16, price: "₹1,099/month", cpu: "450%", ssd: "140GB" },
+  { name: "Max",     ram: "12GB", ramGB: 12, price: "₹829/month",   cpu: "350%", ssd: "100GB" },
+  { name: "Titan",   ram: "16GB", ramGB: 16, price: "₹1,099/month", cpu: "400%", ssd: "140GB" },
 ];
 
 export const MAX_PLAN = PLANS[PLANS.length - 1].name;

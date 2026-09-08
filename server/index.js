@@ -553,15 +553,15 @@ app.get("/api/location", (req, res) => {
 const PLAN_PRICES_PATH = resolve(__dirname, "../data/plan_prices.json");
 
 const PLAN_SPECS_DEFAULT = {
-  Nano:    { ram: "1GB",  cpu: "50%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
+  Nano:    { ram: "1GB",  cpu: "75%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
   Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB",  priceInr: 0,    tier: "Entry" },
   Plus:    { ram: "3GB",  cpu: "150%", ssd: "15GB",  priceInr: 129,  tier: "Entry" },
   Starter: { ram: "4GB",  cpu: "200%", ssd: "25GB",  priceInr: 199,  tier: "Community", popular: true },
   Pro:     { ram: "6GB",  cpu: "250%", ssd: "40GB",  priceInr: 329,  tier: "Community" },
   Elite:   { ram: "8GB",  cpu: "300%", ssd: "60GB",  priceInr: 469,  tier: "Community" },
   Ultra:   { ram: "10GB", cpu: "350%", ssd: "80GB",  priceInr: 649,  tier: "Advanced" },
-  Max:     { ram: "12GB", cpu: "400%", ssd: "100GB", priceInr: 829,  tier: "Advanced" },
-  Titan:   { ram: "16GB", cpu: "450%", ssd: "140GB", priceInr: 1099, tier: "Advanced" },
+  Max:     { ram: "12GB", cpu: "350%", ssd: "100GB", priceInr: 829,  tier: "Advanced" },
+  Titan:   { ram: "16GB", cpu: "400%", ssd: "140GB", priceInr: 1099, tier: "Advanced" },
 };
 
 // Merge saved prices into the spec — only priceInr and popular are overrideable
