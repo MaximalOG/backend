@@ -290,7 +290,6 @@ export async function getServersByPterodactylUser(pterodactylUserId) {
 export async function suspendServer(pterodactylServerId) {
   return panelFetch(`/servers/${pterodactylServerId}/suspend`, { method: "POST" });
 }
-
 /** Unsuspend a server. */
 export async function unsuspendServer(pterodactylServerId) {
   return panelFetch(`/servers/${pterodactylServerId}/unsuspend`, { method: "POST" });
@@ -299,6 +298,75 @@ export async function unsuspendServer(pterodactylServerId) {
 /** Delete a server permanently. */
 export async function deleteServer(pterodactylServerId) {
   return panelFetch(`/servers/${pterodactylServerId}`, { method: "DELETE" });
+}
+
+/**
+ * Update a server's startup environment variables and docker image.
+ * Used for version/software changes without full reprovisioning.
+ */
+export async function updateServerStartup({ pterodactylServerId, eggId, mcVersion, javaVersion }) {
+  const JAVA_IMAGE_FALLBACKS = {
+    "Java 25": "ghcr.io/pterodactyl/yolks:java_25",
+    "Java 21": "ghcr.io/pterodactyl/yolks:java_21",
+    "Java 17": "ghcr.io/pterodactyl/yolks:java_17",
+    "Java 16": "ghcr.io/pterodactyl/yolks:java_16",
+    "Java 11": "ghcr.io/pterodactyl/yolks:java_11",
+    "Java 8":  "ghcr.io/pterodactyl/yolks:java_8",
+  };
+
+  // Fetch egg to get docker images + environment variables
+  const eggData = await panelFetch(`/nests/${NEST_ID}/eggs/${eggId}?include=variables`);
+  const egg     = eggData.attributes;
+
+  // Pick docker image
+  const imageMap     = egg.docker_images ?? {};
+  const imageKeys    = Object.keys(imageMap);
+  const preferredKey = javaVersion && imageKeys.find(k => k === javaVersion);
+  const dockerImage  = preferredKey
+    ? imageMap[preferredKey]
+    : (javaVersion && JAVA_IMAGE_FALLBACKS[javaVersion])
+      ?? imageMap[imageKeys[0]]
+      ?? egg.docker_image;
+
+  // Build environment from egg defaults
+  const environment = {};
+  if (egg.relationships?.variables?.data) {
+    for (const v of egg.relationships.variables.data) {
+      const attr = v.attributes;
+      environment[attr.env_variable] = attr.default_value ?? "";
+    }
+  }
+  if (mcVersion && mcVersion !== "latest") {
+    if ("MINECRAFT_VERSION" in environment) environment.MINECRAFT_VERSION = mcVersion;
+    if ("VANILLA_VERSION"   in environment) environment.VANILLA_VERSION   = mcVersion;
+    if ("MC_VERSION"        in environment) environment.MC_VERSION        = mcVersion;
+  }
+  if ("SERVER_JARFILE" in environment && !environment.SERVER_JARFILE) {
+    environment.SERVER_JARFILE = "server.jar";
+  }
+  environment.EULA = "TRUE";
+
+  // PATCH /servers/:id/startup — updates egg, docker image, and environment
+  await panelFetch(`/servers/${pterodactylServerId}/startup`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      egg:          eggId,
+      image:        dockerImage,
+      startup:      egg.startup,
+      environment,
+      skip_scripts: false,
+    }),
+  });
+
+  return { eggId, dockerImage, mcVersion };
+}
+
+/**
+ * Trigger a server reinstall — reinstalls with new egg config.
+ * ⚠ This wipes all server files. The server must be stopped first.
+ */
+export async function reinstallServer(pterodactylServerId) {
+  return panelFetch(`/servers/${pterodactylServerId}/reinstall`, { method: "POST" });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

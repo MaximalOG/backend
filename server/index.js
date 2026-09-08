@@ -38,7 +38,7 @@ import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verif
 import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
-import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal } from "./lib/pterodactyl.js";
+import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal, updateServerStartup, reinstallServer } from "./lib/pterodactyl.js";
 import { savePaymentOrder, getPaymentOrder, markPaymentOrderPaid } from "./lib/orders.js";
 import { searchProjects, getProject, getBestVersion, LOADER_DIR } from "./lib/modrinth.js";
 import { installFile, deleteFile as deleteInstalledFile, listFiles as listInstalledFiles, logInstall, logUninstall, getInstallerHistory } from "./lib/installer.js";
@@ -2303,6 +2303,131 @@ app.delete("/api/installer/remove", requireUser, async (req, res) => {
   }
 });
 
+// ── GET /api/servers/:id/resources ───────────────────────────────────────────
+// Live hardware usage via Pterodactyl Client API resources endpoint.
+app.get("/api/servers/:id/resources", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.json({ available: false });
+
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.json({ available: false });
+
+  try {
+    const ptRes = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/resources`,
+      {
+        headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(4000),
+      }
+    );
+    if (!ptRes.ok) return res.json({ available: false });
+    const data = await ptRes.json();
+    const attrs = data?.attributes ?? {};
+    const resources = attrs.resources ?? {};
+    res.json({
+      available:   true,
+      state:       attrs.current_state ?? "offline",
+      cpu:         resources.cpu_absolute ?? 0,          // percent
+      memoryBytes: resources.memory_bytes ?? 0,
+      diskBytes:   resources.disk_bytes   ?? 0,
+      netRxBytes:  resources.network_rx_bytes ?? 0,
+      netTxBytes:  resources.network_tx_bytes ?? 0,
+      uptimeMs:    resources.uptime_in_milliseconds ?? 0,
+    });
+  } catch {
+    res.json({ available: false });
+  }
+});
+
+// ── GET /api/servers/:id/version ─────────────────────────────────────────────
+// Returns current server type and MC version
+app.get("/api/servers/:id/version", requireUser, (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  res.json({
+    serverType: srv.serverType ?? null,
+    mcVersion:  srv.mcVersion  ?? null,
+    status:     srv.status,
+  });
+});
+
+// ── POST /api/servers/:id/version ────────────────────────────────────────────
+// Change MC version and/or server software. Does NOT wipe files.
+app.post("/api/servers/:id/version", requireUser, async (req, res) => {
+  const { serverType, mcVersion, javaVersion } = req.body;
+  if (!serverType && !mcVersion) {
+    return res.status(400).json({ error: "At least one of serverType or mcVersion is required." });
+  }
+
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+  if (srv.status === "running") {
+    return res.status(400).json({ error: "Stop the server before changing the version." });
+  }
+
+  const newType    = serverType ?? srv.serverType ?? "paper";
+  const newVersion = mcVersion  ?? srv.mcVersion  ?? "latest";
+
+  const chosen = getServerTypeConfig(newType);
+  if (!chosen) return res.status(400).json({ error: `Invalid server type: ${newType}` });
+
+  // Auto-select Java version if not provided
+  const JAVA_FOR_VERSION: Record<string, string> = {
+    "26.2": "Java 25", "26.1": "Java 25",
+  };
+  const jvFallback = JAVA_FOR_VERSION[newVersion]
+    ?? (newVersion >= "1.20.5" ? "Java 21" : newVersion >= "1.18" ? "Java 17" : newVersion >= "1.17" ? "Java 16" : newVersion >= "1.16" ? "Java 11" : "Java 8");
+  const resolvedJava = javaVersion ?? jvFallback;
+
+  try {
+    await updateServerStartup({
+      pterodactylServerId: srv.pterodactylId,
+      eggId:       chosen.eggId,
+      mcVersion:   newVersion,
+      javaVersion: resolvedJava,
+    });
+
+    // Update local record
+    updateServer(srv.id, { serverType: newType, mcVersion: newVersion });
+    console.log(`[Version] Server ${srv.id} updated to ${newType} ${newVersion} (${resolvedJava})`);
+
+    res.json({
+      ok:         true,
+      serverType: newType,
+      mcVersion:  newVersion,
+      javaVersion: resolvedJava,
+      message:    "Version updated. Start the server to apply the change.",
+    });
+  } catch (err) {
+    console.error("[Version] Update failed:", err.message);
+    res.status(502).json({ error: "Failed to update version: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/reinstall ──────────────────────────────────────────
+// Full reinstall — wipes server files and reinstalls with current egg config.
+app.post("/api/servers/:id/reinstall", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
+  if (srv.status === "running") {
+    return res.status(400).json({ error: "Stop the server before reinstalling." });
+  }
+
+  try {
+    await reinstallServer(srv.pterodactylId);
+    updateServer(srv.id, { status: "installing" });
+    console.log(`[Reinstall] Server ${srv.id} reinstalling`);
+    res.json({ ok: true, message: "Reinstall started. This will take 1–2 minutes." });
+  } catch (err) {
+    console.error("[Reinstall] Failed:", err.message);
+    res.status(502).json({ error: "Reinstall failed: " + err.message });
+  }
+});
+
 // ── Bot API ───────────────────────────────────────────────────────────────────
 app.use("/bot", botRouter);
 
@@ -2312,45 +2437,42 @@ app.post("/api/account/link-discord", requireUser, async (req, res) => {
   const { code } = req.body;
   if (!code || typeof code !== "string") return res.status(400).json({ error: "code is required." });
 
-  const clean = code.trim().toUpperCase();
+  const clean   = code.trim().toUpperCase();
+  const botKey  = process.env.BOT_API_KEY;
+  const botUrl  = (process.env.BOT_LINK_URL || "http://localhost:8080").replace(/\/$/, "");
 
-  // Validate the code via the bot router's in-memory store
-  // We call the same Express route internally by importing botRouter's linkCodes
-  // — simpler: just duplicate the verify logic since bot.js exports the Map via the router
-  // The cleanest approach: call the /bot/verify-link endpoint internally
-  const botKey = process.env.BOT_API_KEY;
   if (!botKey) return res.status(503).json({ error: "Bot API not configured." });
 
   try {
-    // Internal call to /bot/verify-link — same Express app, avoids network round trip
-    const verifyRes = await fetch(`http://localhost:${process.env.API_PORT || 3001}/bot/verify-link?code=${encodeURIComponent(clean)}`, {
-      headers: { "x-bot-key": botKey },
+    // 1. Verify the code with the bot's link server
+    const verifyRes = await fetch(`${botUrl}/bot/verify-link?code=${encodeURIComponent(clean)}`, {
+      headers: { "X-Bot-Key": botKey },
     });
     if (!verifyRes.ok) {
-      const err = await verifyRes.json();
+      const err = await verifyRes.json().catch(() => ({}));
       return res.status(400).json({ error: err.error || "Invalid or expired code." });
     }
-    const { discordId, discordUsername } = await verifyRes.json();
+    const { discord_id, discordUsername } = await verifyRes.json();
 
-    // Check this Discord account isn't already linked to a different user
-    const existingUser = getUserByDiscordId(discordId);
+    // 2. Check this Discord account isn't already linked to a different user
+    const existingUser = getUserByDiscordId(discord_id);
     if (existingUser && existingUser.id !== req.user.id) {
       return res.status(409).json({ error: "This Discord account is already linked to a different NetherNodes account." });
     }
 
-    // Save discordId to the user's account
-    const updated = updateUserField(req.user.id, { discordId, discordUsername: discordUsername ?? null });
+    // 3. Save discordId to the user's account
+    const updated = updateUserField(req.user.id, { discordId: discord_id, discordUsername: discordUsername ?? null });
     if (!updated) return res.status(404).json({ error: "User not found." });
 
-    // Notify the bot — assign Customer role, send confirmation DM
-    await fetch(`http://localhost:${process.env.API_PORT || 3001}/bot/link-confirmed`, {
+    // 4. Notify the bot — it assigns Customer role and sends confirmation DM
+    await fetch(`${botUrl}/bot/link-confirmed`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-bot-key": botKey },
-      body: JSON.stringify({ discordId, userId: req.user.id, email: req.user.email, code: clean }),
-    }).catch(err => console.warn("[Discord Link] Confirmation notify failed:", err.message));
+      headers: { "X-Bot-Key": botKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ discord_id, user_id: req.user.id, email: req.user.email }),
+    }).catch(err => console.warn("[Discord Link] Bot notification failed:", err.message));
 
-    console.log(`[Discord Link] ${req.user.email} linked to Discord ${discordId}`);
-    res.json({ ok: true, discordId, discordUsername: discordUsername ?? null });
+    console.log(`[Discord Link] ${req.user.email} linked to Discord ${discord_id}`);
+    res.json({ ok: true, discordId: discord_id, discordUsername: discordUsername ?? null });
   } catch (err) {
     console.error("[Discord Link] Error:", err.message);
     res.status(500).json({ error: "Failed to link account. Please try again." });
