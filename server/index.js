@@ -2443,19 +2443,39 @@ app.post("/api/account/link-discord", requireUser, async (req, res) => {
   if (!botKey) return res.status(503).json({ error: "Bot API not configured." });
 
   try {
-    // Verify against our own in-memory link code store (same Express process)
-    // The bot populated this store via POST /bot/generate-link-code
-    const verifyRes = await fetch(
-      `http://localhost:${process.env.API_PORT || 3001}/bot/verify-link?code=${encodeURIComponent(clean)}`,
-      { headers: { "x-bot-key": botKey } }
-    );
-    if (!verifyRes.ok) {
-      const err = await verifyRes.json().catch(() => ({}));
-      return res.status(400).json({ error: err.error || "Invalid or expired code. Run /link again in Discord." });
+    // Verify against the bot's link server first (it generated the code locally)
+    // Fall back to our own in-memory store (if bot called /bot/generate-link-code)
+    const botLinkServer = (process.env.BOT_LINK_URL || "http://localhost:8080").replace(/\/$/, "");
+
+    let discord_id = null;
+    let discordUsername = null;
+
+    // Try bot's own link server first
+    const botVerify = await fetch(`${botLinkServer}/bot/verify-link?code=${encodeURIComponent(clean)}`, {
+      headers: { "X-Bot-Key": botKey },
+      signal: AbortSignal.timeout(3000),
+    }).catch(() => null);
+
+    if (botVerify?.ok) {
+      const body = await botVerify.json();
+      discord_id      = body.discord_id     ?? body.discordId     ?? null;
+      discordUsername  = body.discord_username ?? body.discordUsername ?? null;
+    } else {
+      // Fall back to our own in-memory store
+      const selfVerify = await fetch(
+        `http://localhost:${process.env.API_PORT || 3001}/bot/verify-link?code=${encodeURIComponent(clean)}`,
+        { headers: { "x-bot-key": botKey } }
+      );
+      if (!selfVerify.ok) {
+        const err = await selfVerify.json().catch(() => ({}));
+        return res.status(400).json({ error: err.error || "Invalid or expired code. Run /link again in Discord." });
+      }
+      const body = await selfVerify.json();
+      discord_id      = body.discord_id     ?? body.discordId     ?? null;
+      discordUsername  = body.discord_username ?? body.discordUsername ?? null;
     }
-    const body = await verifyRes.json();
-    const discord_id     = body.discord_id     ?? body.discordId;
-    const discordUsername = body.discord_username ?? body.discordUsername ?? null;
+
+    if (!discord_id) return res.status(400).json({ error: "Invalid code response." });
 
     // Check not already linked to a different user
     const existingUser = getUserByDiscordId(discord_id);
@@ -2467,7 +2487,7 @@ app.post("/api/account/link-discord", requireUser, async (req, res) => {
     const updated = updateUserField(req.user.id, { discordId: discord_id, discordUsername });
     if (!updated) return res.status(404).json({ error: "User not found." });
 
-    // Tell bot the link succeeded (assigns Customer role, sends DM)
+    // Tell the backend's own bot router (cleans up the in-memory code)
     await fetch(
       `http://localhost:${process.env.API_PORT || 3001}/bot/link-confirmed`,
       {
@@ -2475,7 +2495,15 @@ app.post("/api/account/link-discord", requireUser, async (req, res) => {
         headers: { "Content-Type": "application/json", "x-bot-key": botKey },
         body: JSON.stringify({ discordId: discord_id, userId: req.user.id, email: req.user.email, code: clean }),
       }
-    ).catch(err => console.warn("[Discord Link] Confirmation notify failed:", err.message));
+    ).catch(() => {});
+
+    // Also notify the bot's own link server (port 8080) — assigns role, sends DM
+    const botLinkServer = (process.env.BOT_LINK_URL || "http://localhost:8080").replace(/\/$/, "");
+    await fetch(`${botLinkServer}/bot/link-confirmed`, {
+      method: "POST",
+      headers: { "X-Bot-Key": botKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ discord_id, user_id: req.user.id, email: req.user.email }),
+    }).catch(err => console.warn("[Discord Link] Bot notification failed (non-critical):", err.message));
 
     console.log(`[Discord Link] ${req.user.email} linked to Discord ${discord_id}`);
     res.json({ ok: true, discordId: discord_id, discordUsername });
