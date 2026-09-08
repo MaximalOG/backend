@@ -66,9 +66,11 @@ export function validateCode(code) {
         discountType: match.discountType ?? sale.discountType,
         label:        match.name ? `${match.name} Discount` : sale.label,
         codeName:     match.name,
-        plans:        match.plans ?? "all",   // "all" or array of plan names
+        plans:        match.plans ?? "all",
         maxUses:      match.maxUses  ?? null,
         usedCount:    match.usedCount ?? 0,
+        freeType:     match.freeType  ?? "lifetime",   // "lifetime" | "months"
+        freeMonths:   match.freeMonths ?? null,         // number | null
       };
     }
   }

@@ -726,22 +726,29 @@ app.post("/api/create-order", requireUser, async (req, res) => {
 
   if (finalPrice === 0) {
     // Coupon makes it fully free — provision directly without Razorpay
+    // Resolve freeMonths from the coupon (null = lifetime)
+    const coupon = couponCode?.trim() ? validateCode(couponCode.trim()) : null;
+    const freeMonths = coupon?.freeType === "months" ? (coupon.freeMonths ?? null) : null;
+    const couponLabelFinal = couponLabel || (freeMonths ? `${freeMonths}-Month Free Coupon` : "Lifetime Free Coupon");
+
     const issuedInvoice = await createAndSendInvoice({
       userEmail: req.user.email, planName: planKey, planRam: getPlanSpecs()[planKey].ram,
       originalPrice, discountAmount, finalPrice: 0, currency: "INR",
       razorpayPaymentId: "COUPON_FREE", razorpayOrderId: `COUPON_${Date.now()}`,
-      couponLabel: couponLabel || "100% Coupon",
+      couponLabel: couponLabelFinal,
     });
     const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
     // Increment coupon usage for free-via-coupon path
     if (couponCode?.trim()) incrementCodeUsage(couponCode.trim());
-    console.log(`[Order] Coupon 100% — provisioned free server for ${req.user.email} (${planKey})`);
+    console.log(`[Order] Coupon 100% — provisioned free server for ${req.user.email} (${planKey})${freeMonths ? ` | free for ${freeMonths} months` : " | lifetime"}`);
     return res.json({
       free:          true,
       verified:      true,
       orderId:       issuedInvoice.orderId,
       serverId:      pendingServer.id,
-      originalPrice, discountAmount, finalPrice: 0, couponLabel,
+      originalPrice, discountAmount, finalPrice: 0,
+      couponLabel:   couponLabelFinal,
+      freeMonths,
     });
   }
 
