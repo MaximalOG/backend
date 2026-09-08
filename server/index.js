@@ -2435,6 +2435,241 @@ app.post("/api/servers/:id/reinstall", requireUser, async (req, res) => {
   }
 });
 
+// ── GET /api/servers/:id/backups ─────────────────────────────────────────────
+app.get("/api/servers/:id/backups", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.json([]);
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    const r = await fetch(`${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/backups`, {
+      headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+    });
+    if (!r.ok) return res.status(r.status).json({ error: "Failed to fetch backups from panel." });
+    const data = await r.json();
+    const backups = (data?.data ?? []).map(b => ({
+      uuid:        b.attributes.uuid,
+      name:        b.attributes.name,
+      bytes:       b.attributes.bytes ?? 0,
+      createdAt:   b.attributes.created_at,
+      completedAt: b.attributes.completed_at,
+      isSuccessful: b.attributes.is_successful ?? false,
+      isLocked:    b.attributes.is_locked ?? false,
+    }));
+    res.json(backups);
+  } catch (err) {
+    res.status(502).json({ error: "Network error reaching panel: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/backups ─────────────────────────────────────────────
+app.post("/api/servers/:id/backups", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  const { name } = req.body;
+  try {
+    const r = await fetch(`${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/backups`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ name: name || `Backup ${new Date().toISOString()}` }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      return res.status(r.status).json({ error: e?.errors?.[0]?.detail || "Failed to create backup." });
+    }
+    const data = await r.json();
+    res.json({ ok: true, uuid: data?.attributes?.uuid });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── DELETE /api/servers/:id/backups/:uuid ─────────────────────────────────────
+app.delete("/api/servers/:id/backups/:uuid", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    const r = await fetch(`${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/backups/${req.params.uuid}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+    });
+    if (!r.ok && r.status !== 204) return res.status(r.status).json({ error: "Failed to delete backup." });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/backups/:uuid/restore ───────────────────────────────
+app.post("/api/servers/:id/backups/:uuid/restore", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    const r = await fetch(`${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/backups/${req.params.uuid}/restore`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ truncate: false }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      return res.status(r.status).json({ error: e?.errors?.[0]?.detail || "Restore failed." });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── GET /api/servers/:id/whitelist ────────────────────────────────────────────
+// Reads whitelist.json via Pterodactyl Client API file contents endpoint
+app.get("/api/servers/:id/whitelist", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.json({ players: [], enabled: false });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    // Read whitelist.json from the server root
+    const r = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/files/contents?file=%2Fwhitelist.json`,
+      { headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" } }
+    );
+    if (r.status === 404) return res.json({ players: [], enabled: false });
+    if (!r.ok) return res.status(r.status).json({ error: "Could not read whitelist." });
+    const text = await r.text();
+    let players = [];
+    try { players = JSON.parse(text); } catch { players = []; }
+    const mapped = Array.isArray(players) ? players.map(p => ({
+      name: p.name ?? p,
+      uuid: p.uuid ?? null,
+    })) : [];
+    res.json({ players: mapped, enabled: false });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/whitelist ───────────────────────────────────────────
+// Adds a player to whitelist.json by rewriting the file
+app.post("/api/servers/:id/whitelist", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const { username } = req.body;
+  if (!username || typeof username !== "string") return res.status(400).json({ error: "username is required." });
+  if (!/^[a-zA-Z0-9_]{2,16}$/.test(username)) return res.status(400).json({ error: "Invalid Minecraft username." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    // Read current whitelist
+    const rRead = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/files/contents?file=%2Fwhitelist.json`,
+      { headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" } }
+    );
+    let players = [];
+    if (rRead.ok) {
+      try { players = JSON.parse(await rRead.text()); } catch { players = []; }
+      if (!Array.isArray(players)) players = [];
+    }
+    // Check if already whitelisted
+    if (players.some(p => (p.name ?? p)?.toLowerCase() === username.toLowerCase())) {
+      return res.status(409).json({ error: `${username} is already whitelisted.` });
+    }
+    // Add player
+    players.push({ uuid: "", name: username });
+    // Write back
+    const rWrite = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/files/write?file=%2Fwhitelist.json`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "text/plain" },
+        body: JSON.stringify(players, null, 2),
+      }
+    );
+    if (!rWrite.ok) return res.status(rWrite.status).json({ error: "Failed to write whitelist." });
+    res.json({ ok: true, name: username });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── DELETE /api/servers/:id/whitelist/:name ───────────────────────────────────
+app.delete("/api/servers/:id/whitelist/:name", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  const name = decodeURIComponent(req.params.name);
+  try {
+    const rRead = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/files/contents?file=%2Fwhitelist.json`,
+      { headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" } }
+    );
+    if (!rRead.ok) return res.status(404).json({ error: "Whitelist file not found." });
+    let players = [];
+    try { players = JSON.parse(await rRead.text()); } catch { players = []; }
+    if (!Array.isArray(players)) players = [];
+    const filtered = players.filter(p => (p.name ?? p)?.toLowerCase() !== name.toLowerCase());
+    const rWrite = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/files/write?file=%2Fwhitelist.json`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "text/plain" },
+        body: JSON.stringify(filtered, null, 2),
+      }
+    );
+    if (!rWrite.ok) return res.status(rWrite.status).json({ error: "Failed to update whitelist." });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/whitelist/toggle ────────────────────────────────────
+// Sends whitelist on/off command to the console
+app.post("/api/servers/:id/whitelist/toggle", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  const { enabled } = req.body;
+  const cmd = enabled ? "whitelist on" : "whitelist off";
+  try {
+    const r = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/command`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ command: cmd }),
+      }
+    );
+    if (!r.ok && r.status !== 204) return res.status(r.status).json({ error: "Failed to toggle whitelist." });
+    res.json({ ok: true, enabled });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
 // ── Bot API ───────────────────────────────────────────────────────────────────
 app.use("/bot", botRouter);
 
