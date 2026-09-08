@@ -2432,47 +2432,53 @@ app.post("/api/servers/:id/reinstall", requireUser, async (req, res) => {
 app.use("/bot", botRouter);
 
 // ── POST /api/account/link-discord ───────────────────────────────────────────
-// User submits their link code from the website — validates with bot, saves discordId.
+// User submits their link code from the website — validates against in-memory
+// store (populated when bot calls POST /bot/generate-link-code), saves discordId.
 app.post("/api/account/link-discord", requireUser, async (req, res) => {
   const { code } = req.body;
   if (!code || typeof code !== "string") return res.status(400).json({ error: "code is required." });
 
-  const clean   = code.trim().toUpperCase();
-  const botKey  = process.env.BOT_API_KEY;
-  const botUrl  = (process.env.BOT_LINK_URL || "http://localhost:8080").replace(/\/$/, "");
-
+  const clean  = code.trim().toUpperCase();
+  const botKey = process.env.BOT_API_KEY;
   if (!botKey) return res.status(503).json({ error: "Bot API not configured." });
 
   try {
-    // 1. Verify the code with the bot's link server
-    const verifyRes = await fetch(`${botUrl}/bot/verify-link?code=${encodeURIComponent(clean)}`, {
-      headers: { "X-Bot-Key": botKey },
-    });
+    // Verify against our own in-memory link code store (same Express process)
+    // The bot populated this store via POST /bot/generate-link-code
+    const verifyRes = await fetch(
+      `http://localhost:${process.env.API_PORT || 3001}/bot/verify-link?code=${encodeURIComponent(clean)}`,
+      { headers: { "x-bot-key": botKey } }
+    );
     if (!verifyRes.ok) {
       const err = await verifyRes.json().catch(() => ({}));
-      return res.status(400).json({ error: err.error || "Invalid or expired code." });
+      return res.status(400).json({ error: err.error || "Invalid or expired code. Run /link again in Discord." });
     }
-    const { discord_id, discordUsername } = await verifyRes.json();
+    const body = await verifyRes.json();
+    const discord_id     = body.discord_id     ?? body.discordId;
+    const discordUsername = body.discord_username ?? body.discordUsername ?? null;
 
-    // 2. Check this Discord account isn't already linked to a different user
+    // Check not already linked to a different user
     const existingUser = getUserByDiscordId(discord_id);
     if (existingUser && existingUser.id !== req.user.id) {
       return res.status(409).json({ error: "This Discord account is already linked to a different NetherNodes account." });
     }
 
-    // 3. Save discordId to the user's account
-    const updated = updateUserField(req.user.id, { discordId: discord_id, discordUsername: discordUsername ?? null });
+    // Save to user record
+    const updated = updateUserField(req.user.id, { discordId: discord_id, discordUsername });
     if (!updated) return res.status(404).json({ error: "User not found." });
 
-    // 4. Notify the bot — it assigns Customer role and sends confirmation DM
-    await fetch(`${botUrl}/bot/link-confirmed`, {
-      method: "POST",
-      headers: { "X-Bot-Key": botKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ discord_id, user_id: req.user.id, email: req.user.email }),
-    }).catch(err => console.warn("[Discord Link] Bot notification failed:", err.message));
+    // Tell bot the link succeeded (assigns Customer role, sends DM)
+    await fetch(
+      `http://localhost:${process.env.API_PORT || 3001}/bot/link-confirmed`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-bot-key": botKey },
+        body: JSON.stringify({ discordId: discord_id, userId: req.user.id, email: req.user.email, code: clean }),
+      }
+    ).catch(err => console.warn("[Discord Link] Confirmation notify failed:", err.message));
 
     console.log(`[Discord Link] ${req.user.email} linked to Discord ${discord_id}`);
-    res.json({ ok: true, discordId: discord_id, discordUsername: discordUsername ?? null });
+    res.json({ ok: true, discordId: discord_id, discordUsername });
   } catch (err) {
     console.error("[Discord Link] Error:", err.message);
     res.status(500).json({ error: "Failed to link account. Please try again." });
