@@ -2375,7 +2375,7 @@ app.post("/api/servers/:id/version", requireUser, async (req, res) => {
   if (!chosen) return res.status(400).json({ error: `Invalid server type: ${newType}` });
 
   // Auto-select Java version if not provided
-  const JAVA_FOR_VERSION: Record<string, string> = {
+  const JAVA_FOR_VERSION = {
     "26.2": "Java 25", "26.1": "Java 25",
   };
   const jvFallback = JAVA_FOR_VERSION[newVersion]
