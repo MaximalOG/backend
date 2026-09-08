@@ -2498,7 +2498,6 @@ app.post("/api/account/link-discord", requireUser, async (req, res) => {
     ).catch(() => {});
 
     // Also notify the bot's own link server (port 8080) — assigns role, sends DM
-    const botLinkServer = (process.env.BOT_LINK_URL || "http://localhost:8080").replace(/\/$/, "");
     await fetch(`${botLinkServer}/bot/link-confirmed`, {
       method: "POST",
       headers: { "X-Bot-Key": botKey, "Content-Type": "application/json" },
