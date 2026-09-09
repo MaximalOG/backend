@@ -151,6 +151,24 @@ const PLAN_DISK = {
 };
 
 /**
+ * Plan name → CPU limit (%) mapping.
+ * Matches the values shown to customers on the pricing page.
+ * Pterodactyl's cpu field is a percentage of a single core
+ * (100 = one full core, 200 = two cores, etc.)
+ */
+const PLAN_CPU = {
+  Nano:    75,
+  Basic:   100,
+  Plus:    150,
+  Starter: 200,
+  Pro:     250,
+  Elite:   300,
+  Ultra:   350,
+  Max:     350,
+  Titan:   400,
+};
+
+/**
  * Provision a new Minecraft server on Pterodactyl.
  * @param {object} opts
  * @param {number} opts.pterodactylUserId  - Pterodactyl user ID
@@ -164,6 +182,7 @@ const PLAN_DISK = {
 export async function provisionServer({ pterodactylUserId, serverName, planName, eggId, mcVersion, javaVersion }) {
   const ram  = PLAN_RAM[planName]  ?? 4096;
   const disk = PLAN_DISK[planName] ?? 25600;
+  const cpu  = PLAN_CPU[planName]  ?? 100;  // enforced CPU % — never unlimited
 
   // Fetch egg to get docker images + variables
   const eggData = await panelFetch(`/nests/${NEST_ID}/eggs/${eggId}?include=variables`);
@@ -224,7 +243,7 @@ export async function provisionServer({ pterodactylUserId, serverName, planName,
       swap:   0,
       disk,
       io:     500,
-      cpu:    0,   // unlimited — panel enforces node limits
+      cpu,   // enforced per-plan CPU limit (% of a single vCPU core)
     },
     feature_limits: {
       databases:   planName === "Nano" || planName === "Basic" || planName === "Plus" ? 1 : 3,

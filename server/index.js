@@ -2211,14 +2211,28 @@ app.post("/api/installer/install", requireUser, installerInstallLimiter, async (
   const serverSoftware = srv.serverType ?? "paper";
   const mcVersion      = srv.mcVersion  ?? null;
 
+  // Derive Java version from MC version — used to filter incompatible plugin builds
+  // This mirrors the MC_VERSIONS mapping in the frontend ServerVersion.tsx
+  function deriveJavaVersion(mc) {
+    if (!mc) return "Java 21";
+    if (mc.startsWith("26.") || mc.startsWith("25.")) return "Java 25";
+    const [, minor, patch] = mc.split(".").map(Number);
+    if (minor >= 21 || (minor === 20 && patch >= 5)) return "Java 21";
+    if (minor >= 17) return "Java 17";
+    if (minor === 16) return "Java 16";
+    if (minor >= 12) return "Java 11";
+    return "Java 8";
+  }
+  const javaVersion = deriveJavaVersion(mcVersion);
+
   try {
     let version;
     if (versionId) {
-      // Specific version requested
+      // Specific version requested — still validate Java compatibility
       const project = await getProject(projectId);
-      version = project.versions?.find(v => v.id === versionId) ?? await getBestVersion(projectId, { mcVersion, serverSoftware });
+      version = project.versions?.find(v => v.id === versionId) ?? await getBestVersion(projectId, { mcVersion, serverSoftware, javaVersion });
     } else {
-      version = await getBestVersion(projectId, { mcVersion, serverSoftware });
+      version = await getBestVersion(projectId, { mcVersion, serverSoftware, javaVersion });
     }
 
     if (!version) {
