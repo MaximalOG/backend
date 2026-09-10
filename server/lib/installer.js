@@ -88,7 +88,17 @@ export async function installFile({ identifier, fileUrl, filename, targetDir }) 
   if (!uploadUrlRes.ok) throw new Error(`Pterodactyl upload URL fetch failed: ${uploadUrlRes.status}`);
   const { attributes: { url: uploadUrl } } = await uploadUrlRes.json();
 
-  // 3. Upload via multipart form to the target directory
+  // 3. Create target directory if it doesn't exist (fresh servers may not have /plugins or /mods yet)
+  try {
+    await fetch(`${panelUrl}/api/client/servers/${identifier}/files/create-folder`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${clientKey}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ root: "/", name: targetDir }),
+    });
+    // 400/409 here means folder already exists — that's fine, ignore it
+  } catch { /* ignore */ }
+
+  // 4. Upload via multipart form to the target directory
   const form = new FormData();
   const blob = new Blob([fileBuffer], { type: "application/java-archive" });
   form.append("files", blob, filename);
@@ -97,7 +107,11 @@ export async function installFile({ identifier, fileUrl, filename, targetDir }) 
     `${uploadUrl}&directory=/${targetDir}`,
     { method: "POST", body: form }
   );
-  if (!uploadRes.ok) throw new Error(`File upload failed: ${uploadRes.status}`);
+  if (!uploadRes.ok) {
+    let detail = "";
+    try { detail = JSON.stringify(await uploadRes.json()); } catch {}
+    throw new Error(`File upload failed: ${uploadRes.status}${detail ? ` — ${detail}` : ""}`);
+  }
 
   return filename;
 }

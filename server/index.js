@@ -1936,6 +1936,10 @@ app.get("/api/servers/:id/files", requireUser, async (req, res) => {
     const data = await clientFetch(identifier, `/files/list?directory=${encodeURIComponent(dir)}`);
     res.json(data?.data ?? []);
   } catch (err) {
+    // 409 = server still installing — return a clean user-facing error
+    if (err.message.includes("409") || err.message.includes("ServerStateConflict")) {
+      return res.status(409).json({ error: "Server is still installing. Please wait a minute and try again." });
+    }
     console.error("[Files] List failed:", err.message);
     res.status(502).json({ error: "Could not list files." });
   }
@@ -2214,6 +2218,11 @@ app.post("/api/installer/install", requireUser, installerInstallLimiter, async (
   const srv = getServer(serverId, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server is not yet provisioned." });
+
+  // Block installs while server is still in initial installation process
+  if (srv.status === "installing") {
+    return res.status(409).json({ error: "Server is still installing. Wait for it to finish, then try again." });
+  }
 
   const serverSoftware = srv.serverType ?? "paper";
   const mcVersion      = srv.mcVersion  ?? null;
