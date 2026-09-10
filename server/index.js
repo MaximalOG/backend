@@ -731,14 +731,16 @@ app.post("/api/create-order", requireUser, async (req, res) => {
     const freeMonths = coupon?.freeType === "months" ? (coupon.freeMonths ?? null) : null;
     const couponLabelFinal = couponLabel || (freeMonths ? `${freeMonths}-Month Free Coupon` : "Lifetime Free Coupon");
 
+    // Create pending server first so we have its ID for the invoice
+    const _tempOrderId = `COUPON_${Date.now()}`;
+    const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: _tempOrderId });
     const issuedInvoice = await createAndSendInvoice({
       userEmail: req.user.email, planName: planKey, planRam: getPlanSpecs()[planKey].ram,
       originalPrice, discountAmount, finalPrice: 0, currency: "INR",
-      razorpayPaymentId: "COUPON_FREE", razorpayOrderId: `COUPON_${Date.now()}`,
+      razorpayPaymentId: "COUPON_FREE", razorpayOrderId: _tempOrderId,
       couponLabel: couponLabelFinal,
+      serverId: pendingServer.id,
     });
-    const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
-    // Increment coupon usage for free-via-coupon path
     if (couponCode?.trim()) incrementCodeUsage(couponCode.trim());
     console.log(`[Order] Coupon 100% — provisioned free server for ${req.user.email} (${planKey})${freeMonths ? ` | free for ${freeMonths} months` : " | lifetime"}`);
     return res.json({
@@ -818,14 +820,15 @@ app.post("/api/verify-payment", requireUser, async (req, res) => {
     console.log(`[Order] Coupon usage incremented: ${paidOrder.couponCode}`);
   }
   const planSpec = getPlanSpecs()[paidOrder.planName];
+  const pending = _createPendingServerForUser({ user: req.user, planName: paidOrder.planName, invoiceOrderId: `PAY_${Date.now()}` });
   const invoice = await createAndSendInvoice({
     userEmail: req.user.email, planName: paidOrder.planName, planRam: planSpec.ram,
     originalPrice: paidOrder.originalPrice, discountAmount: paidOrder.discountAmount,
     finalPrice: paidOrder.finalPrice, currency: paidOrder.currency,
     razorpayPaymentId: razorpay_payment_id, razorpayOrderId: razorpay_order_id,
     couponLabel: paidOrder.couponLabel,
+    serverId: pending.id,
   });
-  const pending = _createPendingServerForUser({ user: req.user, planName: paidOrder.planName, invoiceOrderId: invoice.orderId });
   return res.json({ verified: true, mock: Boolean(order.mock), orderId: invoice.orderId, serverId: pending.id });
 
   /* Legacy verification implementation intentionally removed. It is kept
@@ -908,6 +911,7 @@ app.post("/api/resend-invoice", async (req, res) => {
       razorpayPaymentId: invoice.razorpayPaymentId,
       razorpayOrderId:  invoice.razorpayOrderId,
       couponLabel:      invoice.couponLabel,
+      serverId:         invoice.serverId ?? null,
     });
     console.log(`[Invoice] Resent ${orderId} to ${invoice.userEmail}`);
     res.json({ ok: true, email: invoice.userEmail });
@@ -1186,12 +1190,14 @@ app.post("/api/claim-free", requireUser, async (req, res) => {
     return res.status(409).json({ error: "Your account has already claimed this free plan." });
   }
 
+  const _freeTempId = `FREE_${Date.now()}`;
+  const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: _freeTempId });
   const issuedInvoice = await createAndSendInvoice({
     userEmail: req.user.email, planName: planKey, planRam: spec.ram,
     originalPrice: 0, discountAmount: 0, finalPrice: 0, currency: "INR",
-    razorpayPaymentId: "FREE", razorpayOrderId: `FREE_${Date.now()}`, couponLabel: "Free Plan",
+    razorpayPaymentId: "FREE", razorpayOrderId: _freeTempId, couponLabel: "Free Plan",
+    serverId: pendingServer.id,
   });
-  const pendingServer = _createPendingServerForUser({ user: req.user, planName: planKey, invoiceOrderId: issuedInvoice.orderId });
   return res.json({ ok: true, planName: planKey, invoiceOrderId: issuedInvoice.orderId, serverId: pendingServer.id });
 });
 // Returns the available server types for the setup wizard
@@ -2148,6 +2154,7 @@ app.post("/api/servers/:id/subscription/link", requireUser, async (req, res) => 
     razorpayPaymentId: razorpayPaymentId ?? razorpaySubscriptionId,
     razorpayOrderId: razorpaySubscriptionId,
     couponLabel: savedOrder.couponLabel,
+    serverId: srv.id,
   });
 
   console.log(`[Subscription] Linked ${razorpaySubscriptionId} to server ${srv.id}`);

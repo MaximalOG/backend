@@ -44,6 +44,7 @@ export async function createAndSendInvoice({
   razorpayPaymentId,
   razorpayOrderId,
   couponLabel,
+  serverId,        // unique server ID included in the invoice email
 }) {
   const orderId   = generateOrderId();
   const issuedAt  = new Date();
@@ -62,6 +63,7 @@ export async function createAndSendInvoice({
     razorpayPaymentId,
     razorpayOrderId,
     couponLabel: couponLabel || null,
+    serverId:    serverId    || null,
     issuedAt: issuedAt.toISOString(),
   };
 
@@ -151,10 +153,22 @@ export async function createAndSendInvoice({
               </tr>
             </table>
 
+            <!-- Server ID — shown prominently so user can reference it in support -->
+            ${serverId ? `
+            <div style="background:linear-gradient(135deg,#0d0518,#0a1020);border:1px solid #7c3aed;border-radius:6px;padding:16px;margin-bottom:24px">
+              <div style="font-size:10px;color:#7c3aed;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Your Server ID</div>
+              <div style="font-family:monospace;font-size:16px;font-weight:700;color:#c084fc;letter-spacing:1px">${serverId}</div>
+              <div style="font-size:11px;color:#555;margin-top:6px">Keep this ID for support requests. Your server will be ready within 60 seconds.</div>
+            </div>` : ""}
+
             <!-- Payment info -->
             <div style="background:#111;border:1px solid #222;border-radius:6px;padding:16px;margin-bottom:24px">
               <div style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Payment Details</div>
               <table style="width:100%">
+                ${serverId ? `<tr>
+                  <td style="color:#666;font-size:12px;padding:3px 0">Server ID</td>
+                  <td style="color:#c084fc;font-size:12px;text-align:right;font-family:monospace">${serverId}</td>
+                </tr>` : ""}
                 <tr>
                   <td style="color:#666;font-size:12px;padding:3px 0">Payment ID</td>
                   <td style="color:#aaa;font-size:12px;text-align:right;font-family:monospace">${razorpayPaymentId}</td>
