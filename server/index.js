@@ -35,7 +35,7 @@ import { getRates, convertPrice, SUPPORTED_CURRENCIES } from "./lib/currency.js"
 import { createOrder, ensureRazorpayPlan, createRazorpaySubscription, cancelRazorpaySubscription, getRazorpaySubscription } from "./lib/payment.js";
 import { login, logout, getSession, requireAuth, requireOwner, getAllStaff, createStaff, updateStaff, deleteStaff } from "./lib/auth.js";
 import { userSignup, userLogin, getUserFromToken, requireUser, userLogout, verifyEmail, resendVerification, forgotPassword, resetPassword, updateUserField, getUserByDiscordId } from "./lib/userAuth.js";
-import { getServersByUser, getServer, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
+import { getServersByUser, getServer, getServerById, getServerByPterodactylIdentifier, setServerStatus, createPendingServer, beginServerProvisioning, markServerProvisioned, updateServer, deleteServerRecord, isHostnameTaken, clearServerHostname } from "./lib/servers.js";
 import { createFeedback, getAllFeedback, addFeedbackReply, clearAllFeedback } from "./lib/feedback.js";
 import { createAndSendInvoice, getAllInvoices, getInvoiceById } from "./lib/invoice.js";
 import { ensurePterodactylUser, provisionServer, getPterodactylServer, getServerTypes, getServerTypeConfig, suspendServer, unsuspendServer, deleteServer as deletePterodactylServer, getConsoleCredentials, sendPowerSignal, updateServerStartup, reinstallServer } from "./lib/pterodactyl.js";
@@ -1268,8 +1268,8 @@ app.get("/api/hostnames/check", hostnameCheckLimiter, async (req, res) => {
 });
 
 // ── GET /api/servers/:id/hostname ─────────────────────────────────────────────
-app.get("/api/servers/:id/hostname", requireUser, (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+app.get("/api/servers/:id/hostname", requireUser, async (req, res) => {
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   res.json({
     hostname:         srv.hostname ?? null,
@@ -1486,14 +1486,60 @@ app.post("/api/servers/:id/setup", requireUser, async (req, res) => {
 
 // ── GET /api/servers ──────────────────────────────────────────────────────────
 app.get("/api/servers", requireUser, async (req, res) => {
-  const records = getServersByUser(req.user.id, req.user.email);
+  const ownedRecords = getServersByUser(req.user.id, req.user.email);
 
-  const enriched = await Promise.allSettled(
-    records.map(async srv => {
+  // ── Find servers where this user is a Pterodactyl subuser ─────────────────
+  // We query the Pterodactyl Client API for every provisioned server and check
+  // whether the current user's email appears in the subuser list.
+  const sharedRecords = [];
+  try {
+    const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+    const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+    if (panelUrl && clientKey) {
+      // The application API lists all servers — we cross-reference with servers.json
+      // to get only ones we track (avoids exposing unrelated panel servers).
+      const allTracked = (() => {
+        try { return JSON.parse(readFileSync(resolve(__dirname, "../data/servers.json"), "utf-8")); }
+        catch { return []; }
+      })();
+
+      const ownedIds = new Set(ownedRecords.map(s => s.id));
+
+      // For each provisioned tracked server not owned by this user, check subuser list
+      const candidates = allTracked.filter(s =>
+        !ownedIds.has(s.id) && s.pterodactylIdentifier
+      );
+
+      await Promise.allSettled(candidates.map(async srv => {
+        try {
+          const r = await fetch(
+            `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/users`,
+            {
+              headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+              signal: AbortSignal.timeout(5000),
+            }
+          );
+          if (!r.ok) return;
+          const data = await r.json();
+          const match = (data?.data ?? []).find(
+            u => u.attributes?.email?.toLowerCase() === req.user.email.toLowerCase()
+          );
+          if (match) {
+            sharedRecords.push({
+              srv,
+              permissions: match.attributes?.permissions ?? [],
+            });
+          }
+        } catch { /* non-fatal — skip this server */ }
+      }));
+    }
+  } catch { /* non-fatal */ }
+
+  // ── Enrich owned servers with live status ─────────────────────────────────
+  const enrichOwned = await Promise.allSettled(
+    ownedRecords.map(async srv => {
       if (!srv.pterodactylId) return _serializeServer(srv);
 
-      // Prefer Client API for live status (returns running/offline accurately)
-      // Fall back to Application API which only knows suspended/installing
       if (srv.pterodactylIdentifier) {
         const clientStatus = await _getServerStatusViaClient(srv.pterodactylIdentifier);
         if (clientStatus) {
@@ -1502,12 +1548,10 @@ app.get("/api/servers", requireUser, async (req, res) => {
         }
       }
 
-      // Fallback: Application API (handles suspended/installing states)
       try {
         const ptSrv = await getPterodactylServer(srv.pterodactylId, null);
         if (ptSrv) {
           const appStatus = _mapPterodactylStatus(ptSrv);
-          // Only use app status for definitive states; unknown stays as last known
           if (appStatus !== "unknown") {
             updateServer(srv.id, { status: appStatus });
             return _serializeServer({ ...srv, status: appStatus });
@@ -1515,18 +1559,34 @@ app.get("/api/servers", requireUser, async (req, res) => {
         }
       } catch { /* non-fatal */ }
 
-      // Neither API returned a clear status — keep last known
       return _serializeServer(srv);
     })
   );
 
-  const results = enriched.map((outcome, i) => {
+  const ownedResults = enrichOwned.map((outcome, i) => {
     if (outcome.status === "fulfilled") return outcome.value;
-    console.error("[Pterodactyl] Status fetch rejection for server", records[i]?.id, outcome.reason);
-    return _serializeServer(records[i]);
+    console.error("[Pterodactyl] Status fetch rejection for server", ownedRecords[i]?.id, outcome.reason);
+    return _serializeServer(ownedRecords[i]);
   });
 
-  res.json(results);
+  // ── Enrich shared servers with live status ────────────────────────────────
+  const enrichShared = await Promise.allSettled(
+    sharedRecords.map(async ({ srv, permissions }) => {
+      const liveStatus = await _getServerStatusViaClient(srv.pterodactylIdentifier).catch(() => null);
+      const status = liveStatus ?? srv.status ?? "unknown";
+      return {
+        ..._serializeServer({ ...srv, status }),
+        shared:      true,
+        permissions, // the exact permission keys this subuser has
+      };
+    })
+  );
+
+  const sharedResults = enrichShared
+    .filter(o => o.status === "fulfilled")
+    .map(o => o.value);
+
+  res.json([...ownedResults, ...sharedResults]);
 });
 
 // ── POST /api/servers/:id/start ───────────────────────────────────────────────
@@ -1569,7 +1629,7 @@ app.post("/api/servers/:id/stop", requireUser, async (req, res) => {
 
 // ── GET /api/servers/:id/status ───────────────────────────────────────────────
 app.get("/api/servers/:id/status", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found" });
 
   if (!srv.pterodactylId) {
@@ -1644,6 +1704,46 @@ async function _provisionAfterPayment({ userEmail, planName, userId, invoiceOrde
   });
 
   console.log(`[Pterodactyl] Pending server record created for ${userEmail} (${planName}). User ID: ${ptUser.id}`);
+}
+
+// ── Helper: get a server record for a user, allowing subuser access ───────────
+// Returns the server record if the user owns it OR is a Pterodactyl subuser.
+// Also returns { _subuser: true, _permissions: [...] } when access is via subuser.
+async function getServerForUser(serverId, userId, email) {
+  // Fast path — owner check (existing behaviour)
+  const owned = getServer(serverId, userId, email);
+  if (owned) return owned;
+
+  // Subuser path — look up by ID, then verify via Pterodactyl
+  const srv = getServerById(serverId);
+  if (!srv || !srv.pterodactylIdentifier) return null;
+
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return null;
+
+  try {
+    const r = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/users`,
+      {
+        headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!r.ok) return null;
+    const data = await r.json();
+    const match = (data?.data ?? []).find(
+      u => u.attributes?.email?.toLowerCase() === email?.toLowerCase()
+    );
+    if (!match) return null;
+    // Attach subuser metadata — routes can read srv._subuser / srv._permissions
+    return Object.assign(Object.create(null), srv, {
+      _subuser:     true,
+      _permissions: match.attributes?.permissions ?? [],
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ── Helper: get live server status via Client API (more reliable than App API) ─
@@ -1810,7 +1910,7 @@ async function _pterodactylClientPower(pterodactylServerId, signal) {
 
 // ── GET /api/servers/:id/users ────────────────────────────────────────────────
 app.get("/api/servers/:id/users", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -1925,7 +2025,7 @@ app.delete("/api/servers/:id/users/:uuid", requireUser, async (req, res) => {
   }
 });
 app.get("/api/servers/:id/files", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -1947,7 +2047,7 @@ app.get("/api/servers/:id/files", requireUser, async (req, res) => {
 
 // ── GET /api/servers/:id/files/contents ───────────────────────────────────────
 app.get("/api/servers/:id/files/contents", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -1967,7 +2067,7 @@ app.get("/api/servers/:id/files/contents", requireUser, async (req, res) => {
 
 // ── POST /api/servers/:id/files/write ─────────────────────────────────────────
 app.post("/api/servers/:id/files/write", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -1989,7 +2089,7 @@ app.post("/api/servers/:id/files/write", requireUser, async (req, res) => {
 
 // ── DELETE /api/servers/:id/files ─────────────────────────────────────────────
 app.delete("/api/servers/:id/files", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -2014,7 +2114,7 @@ app.delete("/api/servers/:id/files", requireUser, async (req, res) => {
 });
 // Returns a short-lived Pterodactyl WebSocket token — never exposes the client key.
 app.get("/api/servers/:id/console-token", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -2037,7 +2137,7 @@ app.post("/api/servers/:id/power", requireUser, async (req, res) => {
   if (!["start", "stop", "restart", "kill"].includes(signal)) {
     return res.status(400).json({ error: "signal must be start, stop, restart, or kill" });
   }
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -2181,7 +2281,7 @@ app.get("/api/installer/search", requireUser, installerSearchLimiter, async (req
 
   let serverSoftware, mcVersion;
   if (serverId) {
-    const srv = getServer(serverId, req.user.id, req.user.email);
+    const srv = await getServerForUser(serverId, req.user.id, req.user.email);
     if (srv) { serverSoftware = srv.serverType; mcVersion = srv.mcVersion; }
   }
 
@@ -2215,7 +2315,7 @@ app.post("/api/installer/install", requireUser, installerInstallLimiter, async (
   const { serverId, projectId, versionId } = req.body;
   if (!serverId || !projectId) return res.status(400).json({ error: "serverId and projectId are required." });
 
-  const srv = getServer(serverId, req.user.id, req.user.email);
+  const srv = await getServerForUser(serverId, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -2300,7 +2400,7 @@ app.post("/api/installer/install", requireUser, installerInstallLimiter, async (
 
 // ── GET /api/installer/installed/:serverId ────────────────────────────────────
 app.get("/api/installer/installed/:serverId", requireUser, async (req, res) => {
-  const srv = getServer(req.params.serverId, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.serverId, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.json({ plugins: [], mods: [], history: [] });
 
@@ -2326,7 +2426,7 @@ app.delete("/api/installer/remove", requireUser, async (req, res) => {
     return res.status(400).json({ error: "directory must be 'plugins' or 'mods'." });
   }
 
-  const srv = getServer(serverId, req.user.id, req.user.email);
+  const srv = await getServerForUser(serverId, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server is not yet provisioned." });
 
@@ -2343,7 +2443,7 @@ app.delete("/api/installer/remove", requireUser, async (req, res) => {
 // ── GET /api/servers/:id/resources ───────────────────────────────────────────
 // Live hardware usage via Pterodactyl Client API resources endpoint.
 app.get("/api/servers/:id/resources", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.json({ available: false });
 
@@ -2380,8 +2480,8 @@ app.get("/api/servers/:id/resources", requireUser, async (req, res) => {
 
 // ── GET /api/servers/:id/version ─────────────────────────────────────────────
 // Returns current server type and MC version
-app.get("/api/servers/:id/version", requireUser, (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+app.get("/api/servers/:id/version", requireUser, async (req, res) => {
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   res.json({
     serverType: srv.serverType ?? null,
@@ -2467,7 +2567,7 @@ app.post("/api/servers/:id/reinstall", requireUser, async (req, res) => {
 
 // ── GET /api/servers/:id/backups ─────────────────────────────────────────────
 app.get("/api/servers/:id/backups", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.json([]);
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2496,7 +2596,7 @@ app.get("/api/servers/:id/backups", requireUser, async (req, res) => {
 
 // ── POST /api/servers/:id/backups ─────────────────────────────────────────────
 app.post("/api/servers/:id/backups", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2522,7 +2622,7 @@ app.post("/api/servers/:id/backups", requireUser, async (req, res) => {
 
 // ── DELETE /api/servers/:id/backups/:uuid ─────────────────────────────────────
 app.delete("/api/servers/:id/backups/:uuid", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2542,7 +2642,7 @@ app.delete("/api/servers/:id/backups/:uuid", requireUser, async (req, res) => {
 
 // ── POST /api/servers/:id/backups/:uuid/restore ───────────────────────────────
 app.post("/api/servers/:id/backups/:uuid/restore", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2567,7 +2667,7 @@ app.post("/api/servers/:id/backups/:uuid/restore", requireUser, async (req, res)
 // ── GET /api/servers/:id/whitelist ────────────────────────────────────────────
 // Reads whitelist.json via Pterodactyl Client API file contents endpoint
 app.get("/api/servers/:id/whitelist", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.json({ players: [], enabled: false });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2597,7 +2697,7 @@ app.get("/api/servers/:id/whitelist", requireUser, async (req, res) => {
 // ── POST /api/servers/:id/whitelist ───────────────────────────────────────────
 // Adds a player to whitelist.json by rewriting the file
 app.post("/api/servers/:id/whitelist", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const { username } = req.body;
@@ -2641,7 +2741,7 @@ app.post("/api/servers/:id/whitelist", requireUser, async (req, res) => {
 
 // ── DELETE /api/servers/:id/whitelist/:name ───────────────────────────────────
 app.delete("/api/servers/:id/whitelist/:name", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
@@ -2676,7 +2776,7 @@ app.delete("/api/servers/:id/whitelist/:name", requireUser, async (req, res) => 
 // ── POST /api/servers/:id/whitelist/toggle ────────────────────────────────────
 // Sends whitelist on/off command to the console
 app.post("/api/servers/:id/whitelist/toggle", requireUser, async (req, res) => {
-  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
   if (!srv) return res.status(404).json({ error: "Server not found." });
   if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
   const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");

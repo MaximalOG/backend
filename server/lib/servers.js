@@ -52,9 +52,23 @@ export function getServer(id, userId, email) {
   return srv;
 }
 
+/**
+ * Get a single server by ID without an ownership check.
+ * Used for subuser access — caller must have already verified the user is
+ * a Pterodactyl subuser on this server before calling this.
+ */
+export function getServerById(id) {
+  return load().find(s => s.id === id) || null;
+}
+
 /** Get a server record by Pterodactyl server ID (panel-side ID). */
 export function getServerByPterodactylId(pterodactylId) {
   return load().find(s => s.pterodactylId === pterodactylId) || null;
+}
+
+/** Get a server record by Pterodactyl short identifier (8-char client API string). */
+export function getServerByPterodactylIdentifier(identifier) {
+  return load().find(s => s.pterodactylIdentifier === identifier) || null;
 }
 
 /**
