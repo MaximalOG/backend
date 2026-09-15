@@ -159,6 +159,27 @@ export function updateServer(id, fields) {
   const servers = load();
   const srv = servers.find(s => s.id === id);
   if (!srv) return null;
+
+  // Safety: never overwrite these transitional statuses via a bare updateServer call
+  // unless the caller explicitly knows what they're doing. Any code that sets status
+  // via updateServer({status: "stopped"}) while the server is installing would wipe
+  // the world on next Start (Pterodactyl re-runs the egg install script).
+  // The only legitimate promotions OUT of these states are:
+  //   installing  → stopped  (egg finished), suspended (payment)
+  //   provisioning → installing (just created), pending_setup (fallback)
+  //   pending_setup → provisioning (setup wizard started)
+  if (
+    fields.status !== undefined &&
+    srv.status === "installing" &&
+    fields.status === "stopped"
+  ) {
+    // Only allow this transition if the caller passes the explicit override flag
+    if (!fields._allowInstallToStopped) {
+      delete fields.status;
+    }
+    delete fields._allowInstallToStopped;
+  }
+
   Object.assign(srv, fields);
   save(servers);
   return srv;

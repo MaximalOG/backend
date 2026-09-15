@@ -1540,6 +1540,31 @@ app.get("/api/servers", requireUser, async (req, res) => {
     ownedRecords.map(async srv => {
       if (!srv.pterodactylId) return _serializeServer(srv);
 
+      // Never overwrite transitional/terminal statuses with a live Pterodactyl poll.
+      // "installing"    — egg is running; Client API reports "offline" but that's wrong.
+      //                   Overwriting to "stopped" causes Start to re-trigger the egg
+      //                   install script, wiping the world (the rollback bug).
+      // "pending_setup" — not yet on Pterodactyl.
+      // "provisioning"  — mid-creation, no reliable status yet.
+      const SKIP_LIVE_POLL = new Set(["installing", "pending_setup", "provisioning"]);
+      if (SKIP_LIVE_POLL.has(srv.status)) {
+        // Only trust the App API for suspended/reinstalling — those are definitive
+        try {
+          const ptSrv = await getPterodactylServer(srv.pterodactylId, null);
+          if (ptSrv && ptSrv.suspended) {
+            updateServer(srv.id, { status: "suspended" });
+            return _serializeServer({ ...srv, status: "suspended" });
+          }
+          // If Pterodactyl says installing is complete (not installing, not suspended),
+          // promote to "stopped" so the server becomes usable.
+          if (ptSrv && srv.status === "installing" && !ptSrv.installing && !ptSrv.suspended) {
+            updateServer(srv.id, { status: "stopped", _allowInstallToStopped: true });
+            return _serializeServer({ ...srv, status: "stopped" });
+          }
+        } catch { /* non-fatal */ }
+        return _serializeServer(srv);
+      }
+
       if (srv.pterodactylIdentifier) {
         const clientStatus = await _getServerStatusViaClient(srv.pterodactylIdentifier);
         if (clientStatus) {
@@ -1636,6 +1661,19 @@ app.get("/api/servers/:id/status", requireUser, async (req, res) => {
     return res.json({ status: srv.status });
   }
 
+  // Guard: don't overwrite transitional statuses with an unreliable App API poll
+  if (srv.status === "installing" || srv.status === "pending_setup" || srv.status === "provisioning") {
+    try {
+      const ptSrv = await getPterodactylServer(srv.pterodactylId);
+      if (ptSrv?.suspended) { updateServer(srv.id, { status: "suspended" }); return res.json({ status: "suspended" }); }
+      // Egg install finished — Pterodactyl no longer marks it as installing
+      if (srv.status === "installing" && ptSrv && !ptSrv.installing && !ptSrv.suspended) {
+        updateServer(srv.id, { status: "stopped", _allowInstallToStopped: true });
+        return res.json({ status: "stopped" });
+      }
+    } catch { /* non-fatal */ }
+    return res.json({ status: srv.status });
+  }
   try {
     const ptSrv = await getPterodactylServer(srv.pterodactylId);
     const status = ptSrv ? _mapPterodactylStatus(ptSrv) : srv.status;
