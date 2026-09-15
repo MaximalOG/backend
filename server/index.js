@@ -1914,19 +1914,25 @@ async function clientFetchRaw(identifier, path) {
   return res.text();
 }
 
-async function clientFetchWrite(identifier, path, content) {
+async function clientFetchWrite(identifier, path, content, isBinary = false) {
   const panelUrl   = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
   const clientKey  = process.env.PTERODACTYL_CLIENT_KEY;
   if (!panelUrl || !clientKey) throw new Error("Pterodactyl Client API is not configured.");
 
   const url = `${panelUrl}/api/client/servers/${identifier}${path}`;
+
+  // Binary files (images etc.) arrive base64-encoded; decode back to raw bytes
+  // before forwarding so Pterodactyl stores the exact original file.
+  const bodyData    = isBinary ? Buffer.from(content, "base64") : content;
+  const contentType = isBinary ? "application/octet-stream" : "text/plain";
+
   const res = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${clientKey}`,
-      "Content-Type": "text/plain",
+      "Content-Type": contentType,
     },
-    body: content,
+    body: bodyData,
   });
   if (!res.ok && res.status !== 204) {
     let body = "";
@@ -2110,14 +2116,15 @@ app.post("/api/servers/:id/files/write", requireUser, async (req, res) => {
   if (!srv.pterodactylId) return res.status(400).json({ error: "Server is not yet provisioned." });
 
   const { file } = req.query;
-  const { content } = req.body;
+  const { content, encoding } = req.body;
   if (!file) return res.status(400).json({ error: "file path is required." });
   if (content === undefined) return res.status(400).json({ error: "content is required." });
 
+  const isBinary = encoding === "base64";
   const identifier = srv.pterodactylIdentifier || srv.pterodactylId;
 
   try {
-    await clientFetchWrite(identifier, `/files/write?file=${encodeURIComponent(file)}`, content);
+    await clientFetchWrite(identifier, `/files/write?file=${encodeURIComponent(file)}`, content, isBinary);
     res.json({ ok: true });
   } catch (err) {
     console.error("[Files] Write failed:", err.message);
