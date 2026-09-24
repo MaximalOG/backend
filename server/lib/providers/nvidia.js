@@ -8,7 +8,7 @@ import OpenAI from "openai";
 import { buildSystemPrompt } from "../prompt.js";
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_MODEL   = "meta/llama-3.3-70b-instruct";
+const DEFAULT_MODEL   = "z-ai/glm-5-3";
 
 let client = null;
 
@@ -34,7 +34,7 @@ function getClient() {
  */
 export async function generateWithNvidia(message, history = [], ctx = null, attachment = null) {
   const systemPrompt = buildSystemPrompt(ctx);
-  const model = process.env.NVIDIA_MODEL || DEFAULT_MODEL;
+  const primaryModel  = process.env.NVIDIA_MODEL || DEFAULT_MODEL;
 
   // Build user content — preserve existing attachment handling
   let userContent;
@@ -62,9 +62,8 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
     { role: "user", content: userContent },
   ];
 
-  let response;
-  try {
-    response = await getClient().chat.completions.create({
+  const tryModel = async (model) => {
+    return getClient().chat.completions.create({
       model,
       messages,
       temperature: 0.6,
@@ -72,10 +71,35 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
       max_tokens: 1024,
       stream: false,
     });
+  };
+
+  let response;
+  try {
+    response = await tryModel(primaryModel);
   } catch (err) {
-    // Log the full error so it shows up in PM2 logs
-    console.error("[NVIDIA Provider Error]", err?.status, err?.message, JSON.stringify(err?.error ?? {}));
-    throw err;
+    const status  = err?.status ?? 0;
+    const errMsg  = err?.message || "";
+    console.error("[NVIDIA Provider Error]", status, errMsg, JSON.stringify(err?.error ?? {}));
+
+    // If the configured model doesn't exist / is unavailable, retry with the
+    // known-good fallback instead of surfacing a confusing "server busy" error.
+    const isModelError = status === 404 || status === 422
+      || errMsg.includes("model_not_found")
+      || errMsg.includes("does not exist")
+      || errMsg.includes("not found")
+      || errMsg.includes("Invalid model");
+
+    if (isModelError && primaryModel !== DEFAULT_MODEL) {
+      console.warn(`[NVIDIA] Model "${primaryModel}" unavailable — retrying with fallback "${DEFAULT_MODEL}"`);
+      try {
+        response = await tryModel(DEFAULT_MODEL);
+      } catch (fallbackErr) {
+        console.error("[NVIDIA Fallback Error]", fallbackErr?.status, fallbackErr?.message);
+        throw fallbackErr;
+      }
+    } else {
+      throw err;
+    }
   }
 
   return response.choices[0].message.content.trim();

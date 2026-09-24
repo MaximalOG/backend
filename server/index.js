@@ -363,21 +363,30 @@ app.post("/api/chat", async (req, res) => {
     });
 
   } catch (err) {
-    const msg = err?.message || String(err);
-    const status = err?.status || err?.response?.status || 500;
-    console.error("[NetherNodes AI Error]", status, msg);
+    const msg    = err?.message || String(err);
+    const status = err?.status ?? err?.response?.status ?? 500;
+    // Always log the real error — visible in PM2 / server logs
+    console.error("[NetherNodes AI Error]", status, msg, err?.error ?? "");
 
-    // Surface specific provider errors to help with debugging
-    if (status === 401 || msg.includes("401") || msg.includes("Unauthorized") || msg.includes("API key")) {
+    if (status === 401 || msg.includes("401") || msg.includes("Unauthorized") || msg.includes("API key") || msg.includes("api_key")) {
       return res.status(500).json({ error: "AI provider authentication failed. Please check the API key." });
     }
-    if (status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("quota")) {
+    if (status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("quota") || msg.includes("RateLimitError")) {
       return res.status(500).json({ error: "AI provider rate limit reached. Please try again in a moment." });
     }
-    if (status === 503 || msg.includes("503") || msg.includes("unavailable") || msg.includes("overloaded")) {
+    if (status === 503 || status === 529 || msg.includes("503") || msg.includes("529") || msg.includes("unavailable") || msg.includes("overloaded")) {
       return res.status(500).json({ error: "AI provider is temporarily unavailable. Please try again shortly." });
     }
-    return res.status(500).json({ error: "Server is busy, please try again." });
+    if (status === 404 || msg.includes("404") || msg.includes("model_not_found") || msg.includes("does not exist")) {
+      return res.status(500).json({ error: "AI model not found. Please check the NVIDIA_MODEL setting in .env." });
+    }
+    if (status === 422 || msg.includes("422") || msg.includes("invalid") || msg.includes("Unprocessable")) {
+      return res.status(500).json({ error: "AI provider rejected the request. Please try again." });
+    }
+    if (msg.includes("timeout") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED") || msg.includes("AbortError")) {
+      return res.status(500).json({ error: "AI provider timed out. Please try again in a moment." });
+    }
+    return res.status(500).json({ error: "AI is temporarily unavailable. Please try again shortly." });
   }
 });
 
