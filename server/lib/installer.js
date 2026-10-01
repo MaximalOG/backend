@@ -103,8 +103,11 @@ export async function installFile({ identifier, fileUrl, filename, targetDir }) 
   const blob = new Blob([fileBuffer], { type: "application/java-archive" });
   form.append("files", blob, filename);
 
+  // The signed uploadUrl from Pterodactyl already contains query params (?token=...).
+  // Append the directory parameter with proper URL encoding.
+  const separator = uploadUrl.includes("?") ? "&" : "?";
   const uploadRes = await fetch(
-    `${uploadUrl}&directory=/${targetDir}`,
+    `${uploadUrl}${separator}directory=${encodeURIComponent("/" + targetDir)}`,
     { method: "POST", body: form }
   );
   if (!uploadRes.ok) {

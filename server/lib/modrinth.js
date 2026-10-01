@@ -58,15 +58,18 @@ export async function searchProjects({ query = "", type = "all", serverSoftware,
   }
 
   if (mcVersion) {
-    // Include both the exact version AND the minor version (e.g. "1.21.11" + "1.21")
-    // so plugins that list "1.21" support still appear when searching on a 1.21.11 server
+    // Include the exact version AND the major.minor fallback so plugins that
+    // list "1.21" or "26" still appear on a "1.21.4" or "26.1" server.
+    // For calendar versions (26.x) parts.length === 2, so we always try major too.
     const parts = mcVersion.split(".");
-    const minor = parts.length >= 3 ? `${parts[0]}.${parts[1]}` : null;
-    if (minor && minor !== mcVersion) {
-      facets.push([`versions:${mcVersion}`, `versions:${minor}`]);
-    } else {
-      facets.push([`versions:${mcVersion}`]);
-    }
+    const minor = parts.length >= 2 ? `${parts[0]}.${parts[1]}` : null;  // "1.21" or "26.1"
+    const major = parts[0];                                                 // "1"    or "26"
+
+    const versionFacets = [`versions:${mcVersion}`];
+    if (minor && minor !== mcVersion) versionFacets.push(`versions:${minor}`);
+    if (major && major !== minor && major !== mcVersion) versionFacets.push(`versions:${major}`);
+
+    facets.push(versionFacets);
   }
 
   if (serverSoftware) {
@@ -114,8 +117,11 @@ export async function getProject(projectId) {
  * Java 21 handles all 1.x MC releases up through 1.21.x
  */
 const JAVA_REQUIRED_SNAPSHOTS = {
-  // "Java 21" servers: block versions that list 26.x or 25.x game_versions
-  // (these are compiled for Java 25+)
+  // "Java 25" is the newest — nothing is too new for it
+  "Java 25": [],
+  // "Java 21" servers: block versions that ONLY list 26.x or 25.x game_versions
+  // (these are compiled for Java 25+). We check whether ALL game_versions are blocked,
+  // not just any, to avoid rejecting cross-version releases.
   "Java 21": ["26.", "25."],
   // Java 17 servers: also block 1.21.x which requires Java 21
   "Java 17": ["26.", "25.", "1.21"],
@@ -127,14 +133,24 @@ const JAVA_REQUIRED_SNAPSHOTS = {
 
 /**
  * Returns true if a Modrinth version object is compatible with the given
- * Java version. A version is considered incompatible if ANY of its listed
- * game_versions matches a snapshot prefix associated with a newer Java release.
+ * Java version.
+ *
+ * A version is considered incompatible only when EVERY listed game_version
+ * requires a newer Java than what the server has. This way cross-version
+ * releases (e.g. supporting both "1.21.4" and "26.1") remain installable
+ * on Java 21 servers because at least one game_version is within range.
  */
 function isJavaCompatible(version, javaVersion) {
-  if (!javaVersion) return true; // no info — allow all
+  if (!javaVersion) return true;
   const blockedPrefixes = JAVA_REQUIRED_SNAPSHOTS[javaVersion];
-  if (!blockedPrefixes) return true; // unknown Java — allow all
-  return !version.game_versions.some(gv =>
+  if (!blockedPrefixes || blockedPrefixes.length === 0) return true; // Java 25 or unknown — allow all
+
+  const gameVersions = version.game_versions;
+  if (!gameVersions || gameVersions.length === 0) return true;
+
+  // Block only if every single game_version is in the blocked range
+  // (i.e. this build is exclusively for a newer Java)
+  return !gameVersions.every(gv =>
     blockedPrefixes.some(prefix => gv.startsWith(prefix))
   );
 }
@@ -160,21 +176,32 @@ export async function getBestVersion(projectId, { mcVersion, serverSoftware, jav
   // Build the list of MC version strings to try in order
   const mcVersionsToTry = [];
   if (mcVersion) {
-    mcVersionsToTry.push(mcVersion);                          // exact:   "1.21.11"
+    mcVersionsToTry.push(mcVersion);                          // exact:  "1.21.4" or "26.1"
     const parts = mcVersion.split(".");
-    if (parts.length >= 3) {
-      mcVersionsToTry.push(`${parts[0]}.${parts[1]}`);       // minor:   "1.21"
+    // For 1.x.y  → try "1.21" (minor)
+    // For 26.y   → try "26"   (major only — calendar versioning has no patch)
+    // Both cases: parts[0].parts[1] if parts.length >= 2
+    if (parts.length >= 2) {
+      const majorMinor = `${parts[0]}.${parts[1]}`;
+      if (majorMinor !== mcVersion) mcVersionsToTry.push(majorMinor); // "1.21" or already "26.1"
+    }
+    // For 1.x.y also try major-only "1" is not meaningful, but for calendar
+    // versions try just the year number "26" since some mods tag with that
+    if (parts.length === 2 && parts[0].length <= 2) {
+      // Calendar version like "26.1" — also try just "26"
+      mcVersionsToTry.push(parts[0]);
     }
   }
   mcVersionsToTry.push(null); // loader only, no MC filter
 
   for (const tryVersion of mcVersionsToTry) {
-    const params = [];
-    if (tryVersion)      params.push(`game_versions=["${tryVersion}"]`);
-    if (loaders.length)  params.push(`loaders=${JSON.stringify(loaders)}`);
+    const params = new URLSearchParams();
+    if (tryVersion)     params.set("game_versions", JSON.stringify([tryVersion]));
+    if (loaders.length) params.set("loaders", JSON.stringify(loaders));
 
     let url = `/project/${projectId}/version`;
-    if (params.length) url += `?${params.join("&")}`;
+    const qs = params.toString();
+    if (qs) url += `?${qs}`;
 
     const versions = await mfetch(url).catch(() => []);
     if (!Array.isArray(versions) || versions.length === 0) continue;

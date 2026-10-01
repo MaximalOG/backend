@@ -1239,6 +1239,14 @@ app.delete("/api/servers/:id", requireUser, async (req, res) => {
     }
   }
 
+  // If this server had an active subscription, mark it so the user can reclaim
+  // a new server against the same subscription from the pricing page.
+  const linkedSub = getSubscriptionByServerId(srv.id);
+  if (linkedSub && (linkedSub.status === "active" || linkedSub.status === "pending_payment" || linkedSub.status === "created")) {
+    updateSubscription(linkedSub.razorpaySubscriptionId, { serverDeleted: true });
+    console.log(`[Server] Marked subscription ${linkedSub.id} as serverDeleted for server ${srv.id}`);
+  }
+
   deleteServerRecord(srv.id);
   console.log(`[Server] Deleted server record ${srv.id} for ${req.user.email}`);
   res.json({ ok: true });
@@ -2319,6 +2327,257 @@ app.post("/api/servers/:id/subscription/link", requireUser, async (req, res) => 
   res.json({ ok: true, orderId: invoice.orderId, serverId: srv.id });
 });
 
+// ── GET /api/subscriptions ────────────────────────────────────────────────────
+// Returns all subscriptions for the logged-in user, enriched with server info.
+app.get("/api/subscriptions", requireUser, (req, res) => {
+  const subs = getSubscriptionsByUserId(req.user.id);
+  const servers = getServersByUser(req.user.id, req.user.email);
+  const serverMap = Object.fromEntries(servers.map(s => [s.id, s]));
+
+  const enriched = subs.map(sub => {
+    const srv = serverMap[sub.serverId] ?? null;
+    return {
+      id:                    sub.id,
+      razorpaySubscriptionId: sub.razorpaySubscriptionId,
+      status:                sub.status,
+      planName:              sub.planName,
+      amountInr:             sub.amountInr,
+      nextBillingDate:       sub.nextBillingDate,
+      currentPeriodEnd:      sub.currentPeriodEnd,
+      gracePeriodEnd:        sub.gracePeriodEnd,
+      createdAt:             sub.createdAt,
+      activatedAt:           sub.activatedAt,
+      cancelledAt:           sub.cancelledAt,
+      serverId:              sub.serverId,
+      serverName:            srv?.name ?? null,
+      serverStatus:          srv?.status ?? null,
+      serverHost:            srv?.connectionAddress ?? null,
+    };
+  });
+
+  res.json(enriched);
+});
+
+// ── GET /api/subscriptions/reclaimable ────────────────────────────────────────
+// Returns subscriptions that are still active but have no server (user deleted it).
+// Used by the pricing page to show "Create Server" instead of the checkout button.
+app.get("/api/subscriptions/reclaimable", requireUser, (req, res) => {
+  const userSubs = getSubscriptionsByUserId(req.user.id);
+  const servers  = getServersByUser(req.user.id, req.user.email);
+  const serverIds = new Set(servers.map(s => s.id));
+
+  const reclaimable = userSubs.filter(sub => {
+    // Active (or pending payment = still within grace) subscription
+    const isLive = sub.status === "active" || sub.status === "pending_payment" || sub.status === "created";
+    if (!isLive) return false;
+    // Either explicitly marked serverDeleted, or the serverId simply no longer exists
+    return sub.serverDeleted === true || !serverIds.has(sub.serverId);
+  }).map(sub => ({
+    subscriptionId:         sub.id,
+    razorpaySubscriptionId: sub.razorpaySubscriptionId,
+    planName:               sub.planName,
+    status:                 sub.status,
+    currentPeriodEnd:       sub.currentPeriodEnd,
+    amountInr:              sub.amountInr,
+  }));
+
+  res.json(reclaimable);
+});
+
+// ── POST /api/subscriptions/:subId/reclaim ────────────────────────────────────
+// Creates a new pending_setup server linked to the existing active subscription.
+// This is called when a user deleted their server but the subscription is still running —
+// they click "Create Server" on the pricing page instead of buying again.
+app.post("/api/subscriptions/:subId/reclaim", requireUser, async (req, res) => {
+  const userSubs = getSubscriptionsByUserId(req.user.id);
+  const sub = userSubs.find(s => s.id === req.params.subId);
+
+  if (!sub) return res.status(404).json({ error: "Subscription not found." });
+
+  const isLive = sub.status === "active" || sub.status === "pending_payment" || sub.status === "created";
+  if (!isLive) return res.status(409).json({ error: "This subscription is no longer active." });
+
+  // Guard: don't allow reclaim if a server already exists for this subscription
+  const servers = getServersByUser(req.user.id, req.user.email);
+  const existingServer = servers.find(s => s.subscriptionId === sub.id || s.razorpaySubId === sub.razorpaySubscriptionId);
+  if (existingServer) {
+    return res.status(409).json({ error: "A server already exists for this subscription." });
+  }
+
+  const planSpec = getPlanSpecs()[sub.planName];
+  if (!planSpec) return res.status(400).json({ error: "Unknown plan." });
+
+  // Create a new pending_setup server record against the existing subscription
+  const newServer = createPendingServer({
+    userId:        req.user.id,
+    planName:      sub.planName,
+    email:         req.user.email,
+    ram:           planSpec.ram,
+    cpu:           planSpec.cpu,
+    ssd:           planSpec.ssd,
+    invoiceOrderId: `RECLAIM_${sub.id}_${Date.now()}`,
+  });
+
+  // Link the existing subscription to the new server
+  updateServer(newServer.id, {
+    subscriptionId:     sub.id,
+    razorpaySubId:      sub.razorpaySubscriptionId,
+    subscriptionStatus: sub.status,
+    expiryDate:         sub.currentPeriodEnd,
+  });
+
+  // Clear the serverDeleted flag on the subscription
+  updateSubscription(sub.razorpaySubscriptionId, {
+    serverDeleted: false,
+    serverId:      newServer.id,
+  });
+
+  console.log(`[Reclaim] New server ${newServer.id} created for subscription ${sub.id} by ${req.user.email}`);
+  res.json({ ok: true, serverId: newServer.id, planName: sub.planName });
+});
+// Step 1: Create a one-time Razorpay order for early renewal.
+// The order amount equals the subscription's monthly amount.
+// Saves a payment_order record with type "early_renew" so the verify step
+// knows what to do (extend currentPeriodEnd instead of provisioning a server).
+app.post("/api/servers/:id/subscription/early-renew/order", requireUser, async (req, res) => {
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+
+  const sub = getSubscriptionByServerId(srv.id);
+  if (!sub) return res.status(404).json({ error: "No subscription found for this server." });
+  if (sub.status === "cancelled" || sub.status === "halted") {
+    return res.status(409).json({ error: "Cannot pay early on a cancelled or halted subscription." });
+  }
+
+  const amountInr = sub.amountInr;
+  if (!amountInr || amountInr <= 0) return res.status(400).json({ error: "Invalid subscription amount." });
+
+  try {
+    const order = await createOrder({
+      planName:  sub.planName,
+      planPrice: amountInr,
+      currency:  "INR",
+      userEmail: req.user.email,
+    });
+
+    savePaymentOrder({
+      providerOrderId: order.orderId,
+      userId:          req.user.id,
+      userEmail:       req.user.email,
+      planName:        sub.planName,
+      originalPrice:   amountInr,
+      discountAmount:  0,
+      finalPrice:      amountInr,
+      couponLabel:     null,
+      couponCode:      null,
+      currency:        "INR",
+      mock:            Boolean(order.mock),
+      status:          "created",
+      type:            "early_renew",      // distinguishes from initial purchase
+      serverId:        srv.id,
+      subscriptionId:  sub.id,
+      razorpaySubId:   sub.razorpaySubscriptionId,
+      createdAt:       new Date().toISOString(),
+    });
+
+    console.log(`[EarlyRenew] Order ${order.orderId} created for server ${srv.id} by ${req.user.email}`);
+    res.json({ ...order, amountInr, planName: sub.planName });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to create payment order: " + err.message });
+  }
+});
+
+// ── POST /api/servers/:id/subscription/early-renew/verify ────────────────────
+// Step 2: Verify Razorpay payment for early renewal, then extend the subscription.
+//
+// Extension logic:
+//   - If currentPeriodEnd is in the future, extend FROM there (+30 days).
+//   - If currentPeriodEnd is in the past (lapsed), extend from today (+30 days).
+// Example: purchased June 7, currentPeriodEnd = July 7.
+// Pay early on June 19 → new currentPeriodEnd = August 7 (not June 19 + 30).
+app.post("/api/servers/:id/subscription/early-renew/verify", requireUser, async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+  if (!razorpay_order_id || !razorpay_payment_id) {
+    return res.status(400).json({ error: "Missing payment fields." });
+  }
+
+  const order = getPaymentOrder(razorpay_order_id);
+  if (!order || order.userId !== req.user.id) return res.status(404).json({ error: "Payment order not found." });
+  if (order.type !== "early_renew") return res.status(400).json({ error: "Invalid order type." });
+  if (order.status === "paid") return res.status(409).json({ error: "This payment was already processed." });
+
+  // Verify HMAC signature
+  const secret = process.env.RAZORPAY_KEY_SECRET;
+  if (!secret || secret === "REPLACE_ME") {
+    if (!order.mock) return res.status(400).json({ error: "Mock payments not enabled for this order." });
+  } else {
+    if (!razorpay_signature) return res.status(400).json({ error: "Missing signature." });
+    const expectedSig = crypto.createHmac("sha256", secret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+    const eBuf = Buffer.from(expectedSig);
+    const rBuf = Buffer.from(razorpay_signature);
+    if (eBuf.length !== rBuf.length || !crypto.timingSafeEqual(eBuf, rBuf)) {
+      return res.status(400).json({ error: "Payment verification failed." });
+    }
+  }
+
+  // Mark order paid (idempotent guard)
+  const paidOrder = markPaymentOrderPaid(razorpay_order_id, razorpay_payment_id);
+  if (!paidOrder) return res.status(409).json({ error: "This payment was already processed." });
+
+  // Look up the server & subscription
+  const srv = getServer(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+
+  const sub = getSubscriptionByServerId(srv.id);
+  if (!sub) return res.status(404).json({ error: "Subscription not found." });
+
+  // Compute new period end: extend from currentPeriodEnd if still in the future,
+  // otherwise extend from now. Always adds exactly 30 days (one billing cycle).
+  const now            = Date.now();
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const currentEnd     = sub.currentPeriodEnd ? new Date(sub.currentPeriodEnd).getTime() : now;
+  const baseTime       = currentEnd > now ? currentEnd : now;
+  const newPeriodEnd   = new Date(baseTime + THIRTY_DAYS_MS).toISOString();
+
+  updateSubscription(sub.razorpaySubscriptionId, {
+    status:          "active",
+    currentPeriodEnd: newPeriodEnd,
+    gracePeriodEnd:  null,
+  });
+  updateServer(srv.id, {
+    subscriptionStatus: "active",
+    expiryDate:         newPeriodEnd,
+  });
+  recordPayment({
+    razorpaySubscriptionId: sub.razorpaySubscriptionId,
+    razorpayPaymentId:      razorpay_payment_id,
+    amountInr:              order.finalPrice,
+    status:                 "early_renew",
+    event:                  "early_renew",
+  });
+
+  // Issue invoice
+  const planSpec = getPlanSpecs()[sub.planName] ?? {};
+  const invoice  = await createAndSendInvoice({
+    userEmail:         req.user.email,
+    planName:          sub.planName,
+    planRam:           planSpec.ram ?? "N/A",
+    originalPrice:     order.finalPrice,
+    discountAmount:    0,
+    finalPrice:        order.finalPrice,
+    currency:          "INR",
+    razorpayPaymentId: razorpay_payment_id,
+    razorpayOrderId:   razorpay_order_id,
+    couponLabel:       "Early Renewal",
+    serverId:          srv.id,
+  });
+
+  console.log(`[EarlyRenew] Server ${srv.id} extended to ${newPeriodEnd} by ${req.user.email}`);
+  res.json({ ok: true, newPeriodEnd, orderId: invoice.orderId });
+});
+
 // ── Installer rate limiter ────────────────────────────────────────────────────
 const installerSearchLimiter = rateLimit({
   windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
@@ -2669,6 +2928,34 @@ app.post("/api/servers/:id/backups", requireUser, async (req, res) => {
     }
     const data = await r.json();
     res.json({ ok: true, uuid: data?.attributes?.uuid });
+  } catch (err) {
+    res.status(502).json({ error: "Network error: " + err.message });
+  }
+});
+
+// ── GET /api/servers/:id/backups/:uuid/download ───────────────────────────────
+// Returns a short-lived signed download URL from Pterodactyl.
+// The client key never leaves the backend; the frontend gets only the signed URL.
+app.get("/api/servers/:id/backups/:uuid/download", requireUser, async (req, res) => {
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+  if (!srv.pterodactylIdentifier) return res.status(400).json({ error: "Server not provisioned." });
+  const panelUrl  = process.env.PTERODACTYL_URL?.replace(/\/$/, "");
+  const clientKey = process.env.PTERODACTYL_CLIENT_KEY;
+  if (!panelUrl || !clientKey) return res.status(503).json({ error: "Panel not configured." });
+  try {
+    const r = await fetch(
+      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/backups/${req.params.uuid}/download`,
+      { headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" } }
+    );
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      return res.status(r.status).json({ error: e?.errors?.[0]?.detail || "Failed to get download link." });
+    }
+    const data = await r.json();
+    const url = data?.attributes?.url;
+    if (!url) return res.status(502).json({ error: "No download URL returned by panel." });
+    res.json({ url });
   } catch (err) {
     res.status(502).json({ error: "Network error: " + err.message });
   }
