@@ -15,6 +15,12 @@ function getClient() {
       baseURL = "https://openrouter.ai/api/v1";
     } else if (apiKey.startsWith("nvapi-")) {
       baseURL = "https://integrate.api.nvidia.com/v1";
+    } else if (apiKey.startsWith("AIza")) {
+      // Google Gemini — OpenAI-compatible endpoint
+      baseURL = "https://generativelanguage.googleapis.com/v1beta/openai";
+    } else if (apiKey.startsWith("gsk_")) {
+      // Groq — OpenAI-compatible endpoint
+      baseURL = "https://api.groq.com/openai/v1";
     }
     client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
   }

@@ -89,7 +89,7 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
     // Decide whether this is a model-level error (bad model ID, not found, invalid)
     // vs an account/key/rate error. Only retry with fallback on model errors.
     const isModelError =
-      status === 404 || status === 422 ||
+      status === 404 || status === 410 || status === 422 ||
       msg.includes("model_not_found") ||
       msg.includes("does not exist") ||
       msg.includes("not found") ||
