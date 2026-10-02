@@ -369,22 +369,7 @@ app.post("/api/chat", async (req, res) => {
     // Always log the full raw error so PM2 logs show exactly what happened
     console.error("[NetherNodes AI Error] status=%s message=%s error=%j", status, msg, err?.error ?? err?.cause ?? "");
 
-    if (status === 401 || msg.includes("Incorrect API key") || msg.includes("Invalid API key") || msg.includes("No API key")) {
-      return res.status(500).json({ error: "AI provider authentication failed. Please check the API key." });
-    }
-    if (status === 429 || msg.includes("rate limit") || msg.includes("RateLimitError") || msg.includes("quota exceeded")) {
-      return res.status(500).json({ error: "AI provider rate limit reached. Please try again in a moment." });
-    }
-    if (status === 503 || status === 529 || msg.includes("overloaded") || msg.includes("Service Unavailable")) {
-      return res.status(500).json({ error: "AI provider is temporarily unavailable. Please try again shortly." });
-    }
-    if (status === 404 || status === 410 || msg.includes("model_not_found") || msg.includes("does not exist") || msg.includes("not found")) {
-      return res.status(500).json({ error: "AI model not found. Check OPENAI_MODEL in .env." });
-    }
-    if (msg.includes("timeout") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED") || msg.includes("AbortError")) {
-      return res.status(500).json({ error: "AI provider timed out. Please try again." });
-    }
-    return res.status(500).json({ error: "AI is temporarily unavailable. Please try again shortly." });
+    return res.status(500).json({ error: msg || "AI error" });
   }
 });
 
