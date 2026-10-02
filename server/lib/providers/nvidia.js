@@ -8,22 +8,25 @@ import OpenAI from "openai";
 import { buildSystemPrompt } from "../prompt.js";
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_MODEL   = "z-ai/glm-5-3";
 
-let client = null;
+// Known-good stable fallback — used when the configured model is unavailable.
+// meta/llama-3.3-70b-instruct is a first-party NVIDIA NIM model with high uptime.
+const FALLBACK_MODEL = "meta/llama-3.3-70b-instruct";
+
+// Cached client — keyed by API key so a key rotation picks up a fresh client.
+let _client = null;
+let _clientKey = null;
 
 function getClient() {
-  if (!client) {
-    const apiKey = process.env.NVIDIA_API_KEY;
-    if (!apiKey) {
-      throw new Error("NVIDIA_API_KEY is not set in environment.");
-    }
-    client = new OpenAI({
-      apiKey,
-      baseURL: NVIDIA_BASE_URL,
-    });
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) throw new Error("NVIDIA_API_KEY is not set in environment.");
+
+  // Rebuild client if the key changed (e.g. server restarted with new .env)
+  if (!_client || _clientKey !== apiKey) {
+    _client    = new OpenAI({ apiKey, baseURL: NVIDIA_BASE_URL });
+    _clientKey = apiKey;
   }
-  return client;
+  return _client;
 }
 
 /**
@@ -34,12 +37,14 @@ function getClient() {
  */
 export async function generateWithNvidia(message, history = [], ctx = null, attachment = null) {
   const systemPrompt = buildSystemPrompt(ctx);
-  const primaryModel  = process.env.NVIDIA_MODEL || DEFAULT_MODEL;
 
-  // Build user content — preserve existing attachment handling
+  // Read model fresh from env every call — never cache it, so .env edits apply
+  // without a server restart. Fall back to the stable Llama model if not set.
+  const primaryModel = (process.env.NVIDIA_MODEL || FALLBACK_MODEL).trim();
+
+  // Build user content
   let userContent;
   if (attachment?.type === "image") {
-    // NVIDIA NIM supports vision on compatible models; send as image_url
     userContent = [
       { type: "text", text: message || "Please analyze this image." },
       {
@@ -62,8 +67,8 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
     { role: "user", content: userContent },
   ];
 
-  const tryModel = async (model) => {
-    return getClient().chat.completions.create({
+  const tryModel = async (model) =>
+    getClient().chat.completions.create({
       model,
       messages,
       temperature: 0.6,
@@ -71,34 +76,38 @@ export async function generateWithNvidia(message, history = [], ctx = null, atta
       max_tokens: 1024,
       stream: false,
     });
-  };
 
+  // ── First attempt with the configured model ─────────────────────────────────
   let response;
   try {
     response = await tryModel(primaryModel);
-  } catch (err) {
-    const status  = err?.status ?? 0;
-    const errMsg  = err?.message || "";
-    console.error("[NVIDIA Provider Error]", status, errMsg, JSON.stringify(err?.error ?? {}));
+  } catch (primaryErr) {
+    const status = primaryErr?.status ?? 0;
+    const msg    = primaryErr?.message || "";
+    console.error("[NVIDIA] Primary model error:", status, msg, JSON.stringify(primaryErr?.error ?? {}));
 
-    // If the configured model doesn't exist / is unavailable, retry with the
-    // known-good fallback instead of surfacing a confusing "server busy" error.
-    const isModelError = status === 404 || status === 422
-      || errMsg.includes("model_not_found")
-      || errMsg.includes("does not exist")
-      || errMsg.includes("not found")
-      || errMsg.includes("Invalid model");
+    // Decide whether this is a model-level error (bad model ID, not found, invalid)
+    // vs an account/key/rate error. Only retry with fallback on model errors.
+    const isModelError =
+      status === 404 || status === 422 ||
+      msg.includes("model_not_found") ||
+      msg.includes("does not exist") ||
+      msg.includes("not found") ||
+      msg.includes("Invalid model") ||
+      msg.includes("is not supported") ||
+      msg.includes("Unknown model");
 
-    if (isModelError && primaryModel !== DEFAULT_MODEL) {
-      console.warn(`[NVIDIA] Model "${primaryModel}" unavailable — retrying with fallback "${DEFAULT_MODEL}"`);
+    // Only retry if the fallback is different from what we just tried
+    if (isModelError && primaryModel !== FALLBACK_MODEL) {
+      console.warn(`[NVIDIA] Model "${primaryModel}" rejected — retrying with fallback "${FALLBACK_MODEL}"`);
       try {
-        response = await tryModel(DEFAULT_MODEL);
+        response = await tryModel(FALLBACK_MODEL);
       } catch (fallbackErr) {
-        console.error("[NVIDIA Fallback Error]", fallbackErr?.status, fallbackErr?.message);
+        console.error("[NVIDIA] Fallback model also failed:", fallbackErr?.status, fallbackErr?.message);
         throw fallbackErr;
       }
     } else {
-      throw err;
+      throw primaryErr;
     }
   }
 

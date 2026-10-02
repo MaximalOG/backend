@@ -2765,26 +2765,58 @@ app.get("/api/servers/:id/resources", requireUser, async (req, res) => {
   if (!panelUrl || !clientKey) return res.json({ available: false });
 
   try {
-    const ptRes = await fetch(
-      `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/resources`,
-      {
-        headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(4000),
-      }
-    );
+    // Fetch live usage + server details in parallel.
+    // The details endpoint gives us the current allocated limits (memory, disk, cpu)
+    // which may differ from what's stored in servers.json if an admin adjusted them.
+    const [ptRes, detailRes] = await Promise.all([
+      fetch(
+        `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}/resources`,
+        {
+          headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+          signal: AbortSignal.timeout(4000),
+        }
+      ),
+      fetch(
+        `${panelUrl}/api/client/servers/${srv.pterodactylIdentifier}`,
+        {
+          headers: { Authorization: `Bearer ${clientKey}`, Accept: "application/json" },
+          signal: AbortSignal.timeout(4000),
+        }
+      ),
+    ]);
+
     if (!ptRes.ok) return res.json({ available: false });
     const data = await ptRes.json();
     const attrs = data?.attributes ?? {};
     const resources = attrs.resources ?? {};
+
+    // Parse live limits from the server details endpoint
+    let limitMemoryMB = null;
+    let limitDiskMB   = null;
+    let limitCpu      = null;
+    if (detailRes.ok) {
+      try {
+        const detail = await detailRes.json();
+        const limits = detail?.attributes?.limits ?? {};
+        if (limits.memory > 0)  limitMemoryMB = limits.memory;   // MB
+        if (limits.disk > 0)    limitDiskMB   = limits.disk;     // MB
+        if (limits.cpu > 0)     limitCpu      = limits.cpu;      // % of a core
+      } catch { /* non-fatal — limits stay null */ }
+    }
+
     res.json({
-      available:   true,
-      state:       attrs.current_state ?? "offline",
-      cpu:         resources.cpu_absolute ?? 0,          // percent
-      memoryBytes: resources.memory_bytes ?? 0,
-      diskBytes:   resources.disk_bytes   ?? 0,
-      netRxBytes:  resources.network_rx_bytes ?? 0,
-      netTxBytes:  resources.network_tx_bytes ?? 0,
-      uptimeMs:    resources.uptime_in_milliseconds ?? 0,
+      available:    true,
+      state:        attrs.current_state ?? "offline",
+      cpu:          resources.cpu_absolute ?? 0,          // percent used
+      memoryBytes:  resources.memory_bytes ?? 0,
+      diskBytes:    resources.disk_bytes   ?? 0,
+      netRxBytes:   resources.network_rx_bytes ?? 0,
+      netTxBytes:   resources.network_tx_bytes ?? 0,
+      uptimeMs:     resources.uptime_in_milliseconds ?? 0,
+      // Live Pterodactyl limits — null if unavailable
+      limitMemoryMB,
+      limitDiskMB,
+      limitCpu,
     });
   } catch {
     res.json({ available: false });
