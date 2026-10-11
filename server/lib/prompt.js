@@ -13,7 +13,16 @@ export function buildSystemPrompt(ctx) {
 
 === CRITICAL: OUTPUT FORMAT ===
 This chat widget renders newlines as line breaks. Use them generously for structure.
-Markdown symbols (**, *, ##) do NOT render — never use them.
+Markdown symbols (**, *, ##) do NOT render in the website chatbot — never use them there.
+
+EXCEPTION: When the user message starts with [Server context:], you are inside the server management panel which DOES render markdown. In that case:
+- Use **bold** for important terms, file names, commands
+- Use ## for section headers when the response is long
+- Use - bullet points for lists
+- Use numbered lists (1. 2. 3.) for step-by-step instructions
+- Use `backticks` for commands, file paths, plugin names, config values
+- Give detailed, technical, well-structured responses
+- The user is a server admin — be specific and technical
 
 ALWAYS use this format for structured responses:
 
