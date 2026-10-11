@@ -314,7 +314,7 @@ app.post("/api/chat", async (req, res) => {
     if (PLAN_LIST_TRIGGERS.some(t => lower.includes(t))) {
       const lines = ctx.AVAILABLE_PLANS.map(name => {
         const price = ctx.PRICING[name];
-        const spec = ctx.getPlanSpecs()[name];
+        const spec = ctx.PLAN_SPECS[name];
         return `🟢 ${name} — ${spec.ram} RAM · ${price}`;
       }).join("\n");
       return res.json({
@@ -356,7 +356,7 @@ app.post("/api/chat", async (req, res) => {
       showButtons:     !!actionMatch,
       recommendedPlan: recommendedPlan,
       ramRequired:     recommendedPlan
-        ? ctx.getPlanSpecs()[recommendedPlan]?.ram ?? null
+        ? ctx.PLAN_SPECS[recommendedPlan]?.ram ?? null
         : null,
       flowState:       null,
       planResult:      planResult ?? null,
@@ -369,7 +369,22 @@ app.post("/api/chat", async (req, res) => {
     // Always log the full raw error so PM2 logs show exactly what happened
     console.error("[NetherNodes AI Error] status=%s message=%s error=%j", status, msg, err?.error ?? err?.cause ?? "");
 
-    return res.status(500).json({ error: msg || "AI error" });
+    if (status === 401 || msg.includes("Incorrect API key") || msg.includes("Invalid API key") || msg.includes("No API key")) {
+      return res.status(500).json({ error: "AI provider authentication failed. Please check the API key." });
+    }
+    if (status === 429 || msg.includes("rate limit") || msg.includes("RateLimitError") || msg.includes("quota exceeded")) {
+      return res.status(500).json({ error: "AI provider rate limit reached. Please try again in a moment." });
+    }
+    if (status === 503 || status === 529 || msg.includes("overloaded") || msg.includes("Service Unavailable")) {
+      return res.status(500).json({ error: "AI provider is temporarily unavailable. Please try again shortly." });
+    }
+    if (status === 404 || status === 410 || msg.includes("model_not_found") || msg.includes("does not exist") || msg.includes("not found")) {
+      return res.status(500).json({ error: "AI model not found. Check OPENAI_MODEL in .env." });
+    }
+    if (msg.includes("timeout") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED") || msg.includes("AbortError")) {
+      return res.status(500).json({ error: "AI provider timed out. Please try again." });
+    }
+    return res.status(500).json({ error: "AI is temporarily unavailable. Please try again shortly." });
   }
 });
 
@@ -2816,6 +2831,75 @@ app.get("/api/servers/:id/version", requireUser, async (req, res) => {
     mcVersion:  srv.mcVersion  ?? null,
     status:     srv.status,
   });
+});
+
+// ── POST /api/servers/:id/analyze-log ────────────────────────────────────────
+// Console Log Analyzer — sends the last N log lines to the AI for diagnosis.
+// The AI returns a structured analysis: severity, problem, cause, fix steps.
+app.post("/api/servers/:id/analyze-log", requireUser, async (req, res) => {
+  const srv = await getServerForUser(req.params.id, req.user.id, req.user.email);
+  if (!srv) return res.status(404).json({ error: "Server not found." });
+
+  const { lines = [] } = req.body;
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ error: "lines array is required." });
+  }
+
+  const logText = lines.slice(-80).join("\n");
+  const serverContext = [
+    srv.serverType && `Server software: ${srv.serverType}`,
+    srv.mcVersion  && `Minecraft version: ${srv.mcVersion}`,
+    srv.ram        && `RAM allocated: ${srv.ram}`,
+    srv.status     && `Current status: ${srv.status}`,
+  ].filter(Boolean).join(" | ");
+
+  const prompt = `You are a Minecraft server expert. Analyze these console logs and give a concise diagnosis.
+
+Server info: ${serverContext || "unknown"}
+
+Console output (last ${lines.length} lines):
+\`\`\`
+${logText}
+\`\`\`
+
+Reply in EXACTLY this format — no extra text before or after:
+
+SEVERITY: <healthy|warning|error|critical>
+SUMMARY: <one sentence — what is happening overall>
+PROBLEM: <the specific issue detected, or "No issues detected" if logs look clean>
+CAUSE: <most likely root cause, or "N/A">
+FIX:
+- <step 1>
+- <step 2>
+- <step 3 if needed>
+
+Rules:
+- SEVERITY is "healthy" if logs look normal with no errors
+- SEVERITY is "warning" for non-fatal issues (deprecation, slow tick, missing optional config)
+- SEVERITY is "error" for plugin crashes or failed operations that affect gameplay
+- SEVERITY is "critical" for server crashes, OOM, or things that stop the server
+- Keep FIX steps short and actionable — reference actual file paths or commands where possible
+- If no problem found, set FIX to "- Server looks healthy, no action needed"`;
+
+  try {
+    const { text } = await generateAIResponse(prompt, [], null, null);
+
+    // Parse the structured response
+    const severity = text.match(/^SEVERITY:\s*(.+)$/mi)?.[1]?.trim().toLowerCase() || "warning";
+    const summary  = text.match(/^SUMMARY:\s*(.+)$/mi)?.[1]?.trim() || "";
+    const problem  = text.match(/^PROBLEM:\s*(.+)$/mi)?.[1]?.trim() || "";
+    const cause    = text.match(/^CAUSE:\s*(.+)$/mi)?.[1]?.trim() || "";
+    const fixBlock = text.match(/^FIX:\n([\s\S]+?)(?:\n[A-Z]+:|$)/mi)?.[1] || "";
+    const fixSteps = fixBlock.split("\n")
+      .map(l => l.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean);
+
+    console.log(`[AnalyzeLog] Server ${srv.id} — severity: ${severity}`);
+    res.json({ severity, summary, problem, cause, fixSteps });
+  } catch (err) {
+    console.error("[AnalyzeLog] Failed:", err?.message);
+    res.status(500).json({ error: "AI analysis failed. Please try again." });
+  }
 });
 
 // ── POST /api/servers/:id/version ────────────────────────────────────────────

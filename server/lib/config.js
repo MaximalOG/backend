@@ -71,6 +71,7 @@ export function buildAIContext() {
   return {
     AVAILABLE_PLANS: PLANS.map(p => p.name),
     PLAN_SPECS: Object.fromEntries(PLANS.map(p => [p.name, { ram: p.ram, cpu: p.cpu, ssd: p.ssd }])),
+    // getPlanSpecs kept as a plain property alias so callers can do ctx.PLAN_SPECS[name]
     PRICING: Object.fromEntries(PLANS.map(p => [p.name, p.price])),
     MAX_PLAN,
     SUBDOMAIN,
