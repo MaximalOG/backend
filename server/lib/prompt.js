@@ -20,7 +20,7 @@ EXCEPTION: When the user message starts with [Server context:], you are inside t
 - Use ## for section headers when the response is long
 - Use - bullet points for lists
 - Use numbered lists (1. 2. 3.) for step-by-step instructions
-- Use `backticks` for commands, file paths, plugin names, config values
+- Use \`code formatting\` for commands, file paths, plugin names, config values
 - Give detailed, technical, well-structured responses
 - The user is a server admin — be specific and technical
 

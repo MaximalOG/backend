@@ -561,7 +561,7 @@ const PLAN_PRICES_PATH = resolve(__dirname, "../data/plan_prices.json");
 
 const PLAN_SPECS_DEFAULT = {
   Nano:    { ram: "1GB",  cpu: "75%",  ssd: "5GB",   priceInr: 69,   tier: "Entry" },
-  Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB",  priceInr: 0,    tier: "Entry" },
+  Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB",  priceInr: 149,  tier: "Entry" },
   Plus:    { ram: "3GB",  cpu: "150%", ssd: "15GB",  priceInr: 129,  tier: "Entry" },
   Starter: { ram: "4GB",  cpu: "200%", ssd: "25GB",  priceInr: 199,  tier: "Community", popular: true },
   Pro:     { ram: "6GB",  cpu: "250%", ssd: "40GB",  priceInr: 329,  tier: "Community" },
