@@ -53,6 +53,8 @@ import {
 } from "./lib/subscriptions.js";
 import { validateHostname, parseHostname, fullHostname, createSrvRecord, updateSrvRecord, deleteSrvRecord, checkHostnameAvailability, listAllSrvRecords, RESERVED_NAMES } from "./lib/cloudflare.js";
 import botRouter from "./bot.js";
+import botDataRouter from "./bot-api.js";
+import { updateUserTier, recomputeAllTiers } from "./lib/userTiers.js";
 import crypto from "crypto";
 
 // INR base prices are defined in PLAN_SPECS below — single source of truth
@@ -587,7 +589,7 @@ function loadPlanSpecs() {
 }
 
 function savePlanPrices(updates) {
-  // Only persist priceInr and popular overrides — never hardware specs
+  // Persist priceInr, popular, AND hardware spec overrides (ram, cpu, ssd)
   const existing = (() => {
     try { return existsSync(PLAN_PRICES_PATH) ? JSON.parse(readFileSync(PLAN_PRICES_PATH, "utf-8")) : {}; }
     catch { return {}; }
@@ -597,6 +599,10 @@ function savePlanPrices(updates) {
     merged[name] = merged[name] ?? {};
     if ("priceInr" in fields) merged[name].priceInr = Number(fields.priceInr);
     if ("popular"  in fields) merged[name].popular  = Boolean(fields.popular);
+    // Hardware spec overrides
+    if ("ram" in fields && fields.ram) merged[name].ram = String(fields.ram).trim();
+    if ("cpu" in fields && fields.cpu) merged[name].cpu = String(fields.cpu).trim();
+    if ("ssd" in fields && fields.ssd) merged[name].ssd = String(fields.ssd).trim();
   }
   mkdirSync(dirname(PLAN_PRICES_PATH), { recursive: true });
   writeFileSync(PLAN_PRICES_PATH, JSON.stringify(merged, null, 2), "utf-8");
@@ -616,17 +622,26 @@ app.get("/api/admin/plans", requireAuth, requireOwner, (_req, res) => {
 app.patch("/api/admin/plans", requireAuth, requireOwner, (req, res) => {
   const updates = req.body;
   if (!updates || typeof updates !== "object") {
-    return res.status(400).json({ error: "Body must be an object of plan name → { priceInr, popular? }" });
+    return res.status(400).json({ error: "Body must be an object of plan name → { priceInr, popular?, ram?, cpu?, ssd? }" });
   }
-  // Validate — only allow known plan names and numeric prices
+  // Validate — only allow known plan names
   for (const [name, fields] of Object.entries(updates)) {
     if (!PLAN_SPECS_DEFAULT[name]) return res.status(400).json({ error: `Unknown plan: ${name}` });
     if ("priceInr" in fields && (isNaN(Number(fields.priceInr)) || Number(fields.priceInr) < 0)) {
       return res.status(400).json({ error: `Invalid price for ${name}` });
     }
+    if ("ram" in fields && (typeof fields.ram !== "string" || !fields.ram.trim())) {
+      return res.status(400).json({ error: `Invalid RAM for ${name} — must be a string like "4GB"` });
+    }
+    if ("cpu" in fields && (typeof fields.cpu !== "string" || !fields.cpu.trim())) {
+      return res.status(400).json({ error: `Invalid CPU for ${name} — must be a string like "200%"` });
+    }
+    if ("ssd" in fields && (typeof fields.ssd !== "string" || !fields.ssd.trim())) {
+      return res.status(400).json({ error: `Invalid SSD for ${name} — must be a string like "25GB"` });
+    }
   }
   savePlanPrices(updates);
-  console.log("[Plans] Prices updated by owner:", JSON.stringify(updates));
+  console.log("[Plans] Specs updated by owner:", JSON.stringify(updates));
   res.json(loadPlanSpecs());
 });
 
@@ -2261,6 +2276,11 @@ app.post("/api/servers/:id/subscription/cancel", requireUser, async (req, res) =
     });
     updateServer(srv.id, { subscriptionStatus: "cancelled" });
     console.log(`[Subscription] Cancelled ${sub.razorpaySubscriptionId} by user ${req.user.email}`);
+    // Update user tier to free since subscription is now cancelled
+    try {
+      const allSubs = getSubscriptionsByUserId(req.user.id);
+      updateUserTier(req.user.id, req.user.email, allSubs);
+    } catch {}
     res.json({ ok: true, cancelledAt: new Date().toISOString() });
   } catch (err) {
     res.status(502).json({ error: "Failed to cancel subscription: " + err.message });
@@ -3240,8 +3260,11 @@ app.post("/api/servers/:id/whitelist/toggle", requireUser, async (req, res) => {
   }
 });
 
-// ── Bot API ───────────────────────────────────────────────────────────────────
+// ── Bot API (Discord link/verify) ─────────────────────────────────────────────
 app.use("/bot", botRouter);
+
+// ── Bot Data API (separate authenticated API for the Discord bot) ─────────────
+app.use("/bot-api", botDataRouter);
 
 // ── POST /api/account/link-discord ───────────────────────────────────────────
 // User submits their link code from the website — validates against in-memory
@@ -3392,6 +3415,16 @@ app.post("/api/webhooks/razorpay", (req, res) => {
   if (subscriptionId) console.log(`[Webhook] Subscription ID: ${subscriptionId}`);
 
   // --- Handle events ---
+  // Helper: after any sub state change, refresh the user's tier record
+  const refreshTierForSub = (razorpaySubId) => {
+    try {
+      const sub = getSubscriptionByRazorpayId(razorpaySubId);
+      if (!sub?.userId) return;
+      const allSubs = getSubscriptionsByUserId(sub.userId);
+      updateUserTier(sub.userId, sub.userEmail, allSubs);
+    } catch (e) { console.warn("[UserTier] Refresh failed:", e.message); }
+  };
+
   switch (event) {
     case "subscription.activated": {
       if (!subscriptionId) break;
@@ -3426,6 +3459,7 @@ app.post("/api/webhooks/razorpay", (req, res) => {
 
       recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr: null, status: "activated", event });
       console.log(`[Webhook] Subscription ${subscriptionId} activated for server ${sub.serverId}`);
+      refreshTierForSub(subscriptionId);
       break;
     }
 
@@ -3460,6 +3494,7 @@ app.post("/api/webhooks/razorpay", (req, res) => {
         console.warn(`[Webhook] payment.captured but no subscription record for ${subscriptionId}`);
         recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr, status: "captured", event });
       }
+      refreshTierForSub(subscriptionId);
       break;
     }
 
@@ -3474,6 +3509,7 @@ app.post("/api/webhooks/razorpay", (req, res) => {
         recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: paymentId, amountInr: null, status: "failed", event });
         console.log(`[Webhook] Payment failed for sub ${subscriptionId} — 3-day grace period until ${gracePeriodEnd}`);
       }
+      refreshTierForSub(subscriptionId);
       break;
     }
 
@@ -3501,6 +3537,7 @@ app.post("/api/webhooks/razorpay", (req, res) => {
         recordPayment({ razorpaySubscriptionId: subscriptionId, razorpayPaymentId: null, amountInr: null, status: event, event });
       }
       console.log(`[Webhook] Subscription ${event}: ${subscriptionId}`);
+      refreshTierForSub(subscriptionId);
       break;
     }
 
@@ -3589,4 +3626,6 @@ app.delete("/api/admin/tickets/closed", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`NetherNodes API running on port ${PORT}`);
   startGmailPoller(60_000);
+  // Recompute user tiers from scratch on startup so the data is always fresh
+  setImmediate(() => { try { recomputeAllTiers(); } catch {} });
 });

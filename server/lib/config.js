@@ -1,3 +1,34 @@
+import { readFileSync, existsSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const DEFAULTS = {
+  Nano:    { ram: "1GB",  cpu: "75%",  ssd: "5GB"   },
+  Basic:   { ram: "2GB",  cpu: "100%", ssd: "10GB"  },
+  Plus:    { ram: "3GB",  cpu: "150%", ssd: "15GB"  },
+  Starter: { ram: "4GB",  cpu: "200%", ssd: "25GB"  },
+  Pro:     { ram: "6GB",  cpu: "250%", ssd: "40GB"  },
+  Elite:   { ram: "8GB",  cpu: "300%", ssd: "60GB"  },
+  Ultra:   { ram: "10GB", cpu: "350%", ssd: "80GB"  },
+  Max:     { ram: "12GB", cpu: "350%", ssd: "100GB" },
+  Titan:   { ram: "16GB", cpu: "400%", ssd: "140GB" },
+};
+
+function getLiveSpecs() {
+  try {
+    const p = resolve(__dirname, "../../data/plan_prices.json");
+    if (!existsSync(p)) return DEFAULTS;
+    const saved = JSON.parse(readFileSync(p, "utf-8"));
+    const result = { ...DEFAULTS };
+    for (const [name, overrides] of Object.entries(saved)) {
+      if (result[name]) result[name] = { ...result[name], ...overrides };
+    }
+    return result;
+  } catch { return DEFAULTS; }
+}
+
 // ── Single source of truth for all NetherNodes business data ──────────────────
 // Edit this file to update plans, pricing, features — AI picks it up instantly.
 
@@ -66,13 +97,31 @@ export const FEATURES = {
   },
 };
 
-// Build the context object sent to AI on every request
+// Build the context object sent to AI on every request.
+// getLiveSpecs() re-reads plan_prices.json each call so any admin edit
+// to RAM/CPU/SSD/price is reflected in the AI prompt immediately.
 export function buildAIContext() {
+  const liveSpecs = getLiveSpecs();
+
+  // Merge live specs into PLANS so AI sees up-to-date hardware + pricing
+  const livePlans = PLANS.map(p => {
+    const overrides = liveSpecs[p.name] ?? {};
+    return {
+      ...p,
+      ram:      overrides.ram      ?? p.ram,
+      cpu:      overrides.cpu      ?? p.cpu,
+      ssd:      overrides.ssd      ?? p.ssd,
+      priceInr: overrides.priceInr ?? null,
+      price:    overrides.priceInr != null
+                  ? `₹${overrides.priceInr}/month`
+                  : p.price,
+    };
+  });
+
   return {
-    AVAILABLE_PLANS: PLANS.map(p => p.name),
-    PLAN_SPECS: Object.fromEntries(PLANS.map(p => [p.name, { ram: p.ram, cpu: p.cpu, ssd: p.ssd }])),
-    // getPlanSpecs kept as a plain property alias so callers can do ctx.PLAN_SPECS[name]
-    PRICING: Object.fromEntries(PLANS.map(p => [p.name, p.price])),
+    AVAILABLE_PLANS: livePlans.map(p => p.name),
+    PLAN_SPECS: Object.fromEntries(livePlans.map(p => [p.name, { ram: p.ram, cpu: p.cpu, ssd: p.ssd }])),
+    PRICING: Object.fromEntries(livePlans.map(p => [p.name, p.price])),
     MAX_PLAN,
     SUBDOMAIN,
     FEATURES: {
