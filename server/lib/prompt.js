@@ -93,6 +93,7 @@ Tier 3 (Ultra/Max/Titan): ${ctx.FEATURES.tier3.support} support, ${ctx.FEATURES.
 
 Panel: Pterodactyl (Tier 1), custom NetherNodes panel (Tier 2+)
 Versions: All Java Edition versions. Switch anytime from panel.
+Current Minecraft versions: The 1.21.x branch (latest: 1.21.11) is actively supported. Minecraft also uses calendar versioning now — latest stable release is 26.3. Both schemes are valid. Do NOT tell users their version is outdated unless it is genuinely ancient (pre-1.16).
 Refunds: 48-hour money-back guarantee.
 Location: India-based nodes for low ping.
 

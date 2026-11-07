@@ -137,7 +137,7 @@ export function runFlow(state, userMessage, _ctx) {
         ? "moderate"
         : "casual";
       return reply({ ...state, step: "ask_version", activity },
-        "Which Minecraft version — latest (1.21+) or an older one?");
+        "Which Minecraft version — latest (1.21.x / 26.x) or an older one?");
     }
 
     case "ask_version": {

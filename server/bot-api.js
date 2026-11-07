@@ -14,7 +14,7 @@
  */
 
 import { Router } from "express";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { getAllTiers, getUserTierByEmail, getUserTier } from "./lib/userTiers.js";
@@ -273,6 +273,59 @@ router.get("/stats", (_req, res) => {
     },
     updatedAt: new Date().toISOString(),
   });
+});
+
+// ── POST /bot-api/reviews ─────────────────────────────────────────────────────
+// Called by the Discord bot when a user runs /review
+// Body: { discordId, username, rating (1-5), text, avatarUrl? }
+router.post("/reviews", (req, res) => {
+  const { discordId, username, rating, text, avatarUrl } = req.body ?? {};
+
+  if (!username || typeof username !== "string" || username.trim().length === 0)
+    return res.status(400).json({ error: "username is required." });
+  if (!text || typeof text !== "string" || text.trim().length < 5)
+    return res.status(400).json({ error: "text must be at least 5 characters." });
+  if (!rating || typeof rating !== "number" || rating < 1 || rating > 5)
+    return res.status(400).json({ error: "rating must be a number between 1 and 5." });
+
+  const reviewsPath = resolve(__dirname, "../data/reviews.json");
+
+  // Load existing reviews
+  let reviews = [];
+  try {
+    if (existsSync(reviewsPath)) reviews = JSON.parse(readFileSync(reviewsPath, "utf-8"));
+  } catch { reviews = []; }
+
+  // Prevent duplicate: one active review per discordId (update if re-reviewing)
+  if (discordId) {
+    reviews = reviews.filter(r => r.discordId !== discordId);
+  }
+
+  const review = {
+    id:         `rev_${Date.now()}`,
+    discordId:  discordId ?? null,
+    username:   username.trim(),
+    rating:     Math.round(rating),
+    text:       text.trim(),
+    avatarUrl:  avatarUrl ?? null,
+    createdAt:  new Date().toISOString(),
+    approved:   true,   // auto-approve — set to false if you want manual moderation
+  };
+
+  reviews.unshift(review);   // newest first
+
+  // Keep max 100 reviews
+  if (reviews.length > 100) reviews = reviews.slice(0, 100);
+
+  try {
+    mkdirSync(dirname(reviewsPath), { recursive: true });
+    writeFileSync(reviewsPath, JSON.stringify(reviews, null, 2), "utf-8");
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to save review." });
+  }
+
+  console.log(`[Reviews] New review from ${review.username} (${review.rating}★)`);
+  res.status(201).json({ success: true, review });
 });
 
 export default router;

@@ -2877,6 +2877,13 @@ app.post("/api/servers/:id/analyze-log", requireUser, async (req, res) => {
 
 Server info: ${serverContext || "unknown"}
 
+IMPORTANT VERSION CONTEXT (do not contradict this):
+- Minecraft Java Edition versioning: versions 1.21.x use the old scheme (e.g. 1.21.1, 1.21.4, 1.21.11 etc.)
+- As of 2026, Minecraft Java Edition has moved to calendar versioning: latest stable is 26.3
+- The 1.21.x branch is still actively supported — 1.21.11 is a valid and recent version, NOT outdated
+- Do NOT flag a server as outdated or stopped due to version unless you see explicit "outdated version" errors in the logs
+- A server being "stopped" status means it was intentionally stopped or crashed — not that the version is wrong
+
 Console output (last ${lines.length} lines):
 \`\`\`
 ${logText}
@@ -2899,7 +2906,8 @@ Rules:
 - SEVERITY is "error" for plugin crashes or failed operations that affect gameplay
 - SEVERITY is "critical" for server crashes, OOM, or things that stop the server
 - Keep FIX steps short and actionable — reference actual file paths or commands where possible
-- If no problem found, set FIX to "- Server looks healthy, no action needed"`;
+- If no problem found, set FIX to "- Server looks healthy, no action needed"
+- Base your analysis ONLY on what is actually in the logs — do not assume version issues unless the logs explicitly show them`;
 
   try {
     const { text } = await generateAIResponse(prompt, [], null, null);
@@ -3555,6 +3563,31 @@ app.post("/api/feedback", (req, res) => {
   }
   const entry = createFeedback({ ticketId, email, rating, comment });
   res.status(201).json(entry);
+});
+
+// ── GET /api/reviews ─────────────────────────────────────────────────────────
+// Public — returns approved Discord reviews for the website testimonials section.
+app.get("/api/reviews", (_req, res) => {
+  const reviewsPath = resolve(__dirname, "../data/reviews.json");
+  try {
+    if (!existsSync(reviewsPath)) return res.json([]);
+    const reviews = JSON.parse(readFileSync(reviewsPath, "utf-8"));
+    // Only return approved reviews, max 20 for the homepage
+    const approved = reviews
+      .filter(r => r.approved !== false)
+      .slice(0, 20)
+      .map(r => ({
+        id:        r.id,
+        username:  r.username,
+        rating:    r.rating,
+        text:      r.text,
+        avatarUrl: r.avatarUrl ?? null,
+        createdAt: r.createdAt,
+      }));
+    res.json(approved);
+  } catch {
+    res.json([]);
+  }
 });
 
 // ── GET /api/admin/feedback ───────────────────────────────────────────────────
