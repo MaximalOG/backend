@@ -35,8 +35,10 @@ export function saveSale(data) {
 export function getActiveSale() {
   const sale = getSale();
   const now = new Date();
+  // Support both ISO strings (2026-11-08T14:00:00.000Z) and
+  // local datetime strings (2026-11-08T14:00) from datetime-local inputs
   if (sale.startDate && new Date(sale.startDate) > now) return null;
-  if (sale.endDate && new Date(sale.endDate) < now) return null;
+  if (sale.endDate   && new Date(sale.endDate)   < now) return null;
 
   // Public banner requires enabled flag
   if (sale.mode === "public" && !sale.enabled) return null;
