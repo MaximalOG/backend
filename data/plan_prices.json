@@ -1,0 +1,11 @@
+{
+  "Nano":    { "ram": "1GB",  "cpu": "75%",  "ssd": "5GB",   "priceInr": 49,  "popular": false },
+  "Basic":   { "ram": "2GB",  "cpu": "100%", "ssd": "10GB",  "priceInr": 99,  "popular": false },
+  "Plus":    { "ram": "3GB",  "cpu": "150%", "ssd": "15GB",  "priceInr": 149, "popular": false },
+  "Starter": { "ram": "4GB",  "cpu": "200%", "ssd": "20GB",  "priceInr": 199, "popular": true  },
+  "Pro":     { "ram": "6GB",  "cpu": "250%", "ssd": "25GB",  "priceInr": 249, "popular": false },
+  "Elite":   { "ram": "8GB",  "cpu": "300%", "ssd": "30GB",  "priceInr": 299, "popular": false },
+  "Ultra":   { "ram": "10GB", "cpu": "325%", "ssd": "35GB",  "priceInr": 359, "popular": false },
+  "Max":     { "ram": "12GB", "cpu": "325%", "ssd": "45GB",  "priceInr": 399, "popular": false },
+  "Titan":   { "ram": "16GB", "cpu": "350%", "ssd": "60GB",  "priceInr": 499, "popular": false }
+}

@@ -599,10 +599,22 @@ function savePlanPrices(updates) {
     merged[name] = merged[name] ?? {};
     if ("priceInr" in fields) merged[name].priceInr = Number(fields.priceInr);
     if ("popular"  in fields) merged[name].popular  = Boolean(fields.popular);
-    // Hardware spec overrides
-    if ("ram" in fields && fields.ram) merged[name].ram = String(fields.ram).trim();
-    if ("cpu" in fields && fields.cpu) merged[name].cpu = String(fields.cpu).trim();
-    if ("ssd" in fields && fields.ssd) merged[name].ssd = String(fields.ssd).trim();
+    // Hardware spec overrides — strip accidental duplicate suffixes (e.g. "5GBGB" → "5GB")
+    if ("ram" in fields && fields.ram) {
+      let v = String(fields.ram).trim().toUpperCase();
+      v = v.replace(/(GB|MB)+$/, m => m.slice(0, 2)); // keep only one GB/MB
+      merged[name].ram = v;
+    }
+    if ("cpu" in fields && fields.cpu) {
+      let v = String(fields.cpu).trim();
+      v = v.replace(/(%)+$/, "%"); // keep only one %
+      merged[name].cpu = v;
+    }
+    if ("ssd" in fields && fields.ssd) {
+      let v = String(fields.ssd).trim().toUpperCase();
+      v = v.replace(/(GB|MB)+$/, m => m.slice(0, 2));
+      merged[name].ssd = v;
+    }
   }
   mkdirSync(dirname(PLAN_PRICES_PATH), { recursive: true });
   writeFileSync(PLAN_PRICES_PATH, JSON.stringify(merged, null, 2), "utf-8");
