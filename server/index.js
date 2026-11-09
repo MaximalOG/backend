@@ -599,21 +599,19 @@ function savePlanPrices(updates) {
     merged[name] = merged[name] ?? {};
     if ("priceInr" in fields) merged[name].priceInr = Number(fields.priceInr);
     if ("popular"  in fields) merged[name].popular  = Boolean(fields.popular);
-    // Hardware spec overrides — strip accidental duplicate suffixes (e.g. "5GBGB" → "5GB")
-    if ("ram" in fields && fields.ram) {
-      let v = String(fields.ram).trim().toUpperCase();
-      v = v.replace(/(GB|MB)+$/, m => m.slice(0, 2)); // keep only one GB/MB
-      merged[name].ram = v;
+    // Hardware spec overrides — accept plain numbers, append suffix automatically
+    // e.g. ram: 4 → "4GB", cpu: 200 → "200%", ssd: 25 → "25GB"
+    if ("ram" in fields && fields.ram !== undefined && fields.ram !== null && fields.ram !== "") {
+      const n = Number(fields.ram);
+      merged[name].ram = isNaN(n) ? String(fields.ram).trim() : `${n}GB`;
     }
-    if ("cpu" in fields && fields.cpu) {
-      let v = String(fields.cpu).trim();
-      v = v.replace(/(%)+$/, "%"); // keep only one %
-      merged[name].cpu = v;
+    if ("cpu" in fields && fields.cpu !== undefined && fields.cpu !== null && fields.cpu !== "") {
+      const n = Number(fields.cpu);
+      merged[name].cpu = isNaN(n) ? String(fields.cpu).trim() : `${n}%`;
     }
-    if ("ssd" in fields && fields.ssd) {
-      let v = String(fields.ssd).trim().toUpperCase();
-      v = v.replace(/(GB|MB)+$/, m => m.slice(0, 2));
-      merged[name].ssd = v;
+    if ("ssd" in fields && fields.ssd !== undefined && fields.ssd !== null && fields.ssd !== "") {
+      const n = Number(fields.ssd);
+      merged[name].ssd = isNaN(n) ? String(fields.ssd).trim() : `${n}GB`;
     }
   }
   mkdirSync(dirname(PLAN_PRICES_PATH), { recursive: true });
@@ -642,14 +640,14 @@ app.patch("/api/admin/plans", requireAuth, requireOwner, (req, res) => {
     if ("priceInr" in fields && (isNaN(Number(fields.priceInr)) || Number(fields.priceInr) < 0)) {
       return res.status(400).json({ error: `Invalid price for ${name}` });
     }
-    if ("ram" in fields && (typeof fields.ram !== "string" || !fields.ram.trim())) {
-      return res.status(400).json({ error: `Invalid RAM for ${name} — must be a string like "4GB"` });
+    if ("ram" in fields && (isNaN(Number(fields.ram)) || Number(fields.ram) <= 0)) {
+      return res.status(400).json({ error: `Invalid RAM for ${name} — must be a number (e.g. 4)` });
     }
-    if ("cpu" in fields && (typeof fields.cpu !== "string" || !fields.cpu.trim())) {
-      return res.status(400).json({ error: `Invalid CPU for ${name} — must be a string like "200%"` });
+    if ("cpu" in fields && (isNaN(Number(fields.cpu)) || Number(fields.cpu) <= 0)) {
+      return res.status(400).json({ error: `Invalid CPU for ${name} — must be a number (e.g. 200)` });
     }
-    if ("ssd" in fields && (typeof fields.ssd !== "string" || !fields.ssd.trim())) {
-      return res.status(400).json({ error: `Invalid SSD for ${name} — must be a string like "25GB"` });
+    if ("ssd" in fields && (isNaN(Number(fields.ssd)) || Number(fields.ssd) <= 0)) {
+      return res.status(400).json({ error: `Invalid SSD for ${name} — must be a number (e.g. 25)` });
     }
   }
   savePlanPrices(updates);
